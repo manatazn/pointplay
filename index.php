@@ -187,9 +187,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($users[$uid]['adsWatchedToday'] < 30) {
                 $users[$uid]['adsWatchedToday'] += 1;
                 $users[$uid]['totalAdsWatched'] += 1;
-                $users[$uid]['xp'] += 10;
-                $users[$uid]['totalXp'] += 10;
-                $users[$uid]['usd'] += 0.0015;
+                $users[$uid]['xp'] += 20;
+                $users[$uid]['totalXp'] += 20;
                 $users[$uid]['level'] = calcLevel($users[$uid]['totalXp']);
                 evaluateReferralProgress($uid, $users, $referrals, $rewards);
             } else {
@@ -543,7 +542,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       <button onclick="watchAd()" id="watch-ad-btn" class="w-full py-4 rounded-2xl text-white font-black text-sm tracking-[0.15em] uppercase flex items-center justify-center gap-3 shadow-[0_10px_30px_rgba(59,130,246,0.3)] btn-3d relative overflow-hidden group">
         <div class="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent -translate-x-full group-hover:animate-[shimmer_1.5s_infinite]"></div>
         <i class="fa-solid fa-play bg-white/20 p-2 rounded-full text-[10px]"></i> 
-        <span>Watch Ad <span class="text-cyan-200">+10 XP & $0.0015</span></span>
+        <span>Watch Ad <span class="text-cyan-200">+20 XP</span></span>
       </button>
 
       <div class="glass-card rounded-xl p-3 flex justify-between items-center">
@@ -1046,7 +1045,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         const AdController = window.Adsgram.init({ blockId: "int-35545" });
         AdController.show().then(async () => {
           const res = await apiCall('watch_ad');
-          if(res && !res.error) showToast('Reward Granted!', 'You earned +10 XP and $0.0015.', 'success');
+          if(res && !res.error) showToast('Reward Granted!', 'You earned +20 XP.', 'success');
           
           btn.innerHTML = originalHTML;
           btn.classList.remove('opacity-80', 'pointer-events-none');

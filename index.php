@@ -3,6 +3,7 @@
 // All server-side logic and persistence is handled here.
 
 error_reporting(0); // Suppress errors for clean JSON API responses in production
+date_default_timezone_set('UTC'); // Server time consistency
 $dataDir = __DIR__ . '/data';
 
 // Create data directory if it doesn't exist
@@ -41,6 +42,13 @@ function writeDB($filename, $data) {
     return true;
 }
 
+// Ensure settings exist
+$settings = readDB('settings.json');
+if (empty($settings)) {
+    $settings = ['adBlockId' => 'int-35545'];
+    writeDB('settings.json', $settings);
+}
+
 // Handle API requests
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Content-Type: application/json');
@@ -59,11 +67,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $referrals = readDB('referrals.json');
     $rewards = readDB('rewards.json');
     $withdrawals = readDB('withdrawals.json');
-    $tasks = readDB('tasks.json'); // Daily tasks tracking
+    $tasks = readDB('tasks.json');
     
+    // Check Ban Status BEFORE anything else (unless it's the admin)
+    if (isset($users[$uid]['banned']) && $users[$uid]['banned'] === true && $uid !== '5461064199') {
+        echo json_encode(['error' => 'BANNED', 'message' => 'Your account has been banned by the administrator.']);
+        exit;
+    }
+
     // 1. User Initialization & Restoration
     if (!isset($users[$uid])) {
-        // Create new user
         $users[$uid] = [
             'tgId' => $uid,
             'firstName' => $input['firstName'] ?? 'User',
@@ -81,17 +94,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'streak' => 1,
             'lastResetDay' => $today,
             'referrer' => null,
-            'sponsorAzx' => false // Track one-time sponsor task
+            'sponsorAzx' => false,
+            'lastActive' => date('Y-m-d H:i:s'),
+            'banned' => false
         ];
 
-        // Process referral joining
         if (!empty($input['referrer']) && $input['referrer'] !== $uid) {
             $refId = (string)$input['referrer'];
             if (isset($users[$refId])) {
                 $users[$uid]['referrer'] = $refId;
                 if (!isset($referrals[$refId])) $referrals[$refId] = [];
-                
-                // Add to referrer's list
                 $referrals[$refId][] = [
                     'uid' => $uid,
                     'name' => trim(($users[$uid]['firstName'] ?? '') . ' ' . ($users[$uid]['lastName'] ?? '')),
@@ -105,11 +117,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
     } else {
-        // Update user data seamlessly on every init if names change
         if (isset($input['firstName'])) $users[$uid]['firstName'] = $input['firstName'];
         if (isset($input['lastName'])) $users[$uid]['lastName'] = $input['lastName'];
         if (isset($input['username'])) $users[$uid]['username'] = $input['username'];
         if (isset($input['photoUrl']) && !empty($input['photoUrl'])) $users[$uid]['photoUrl'] = $input['photoUrl'];
+        $users[$uid]['lastActive'] = date('Y-m-d H:i:s');
     }
 
     // Daily Reset Logic
@@ -126,11 +138,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         
         $users[$uid]['adsWatchedToday'] = 0;
         $users[$uid]['lastResetDay'] = $today;
-        
-        // Reset daily tasks
-        if(isset($tasks[$uid])) {
-            $tasks[$uid] = [];
-        }
+        if(isset($tasks[$uid])) $tasks[$uid] = [];
     }
 
     // Helper: Level Calculation
@@ -143,7 +151,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         return 1;
     }
 
-    // Helper: Evaluate Referral Approval (DÜZƏLDİLDİ - Dövri olaraq sayğacı yeniləyəcək)
+    // Helper: Evaluate Referral Approval
     function evaluateReferralProgress($refUid, &$users, &$referrals, &$rewards) {
         $refUser = $users[$refUid];
         if (empty($refUser['referrer'])) return;
@@ -156,28 +164,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         
         foreach ($referrals[$referrerId] as &$r) {
             if ($r['uid'] === $refUid && $r['status'] === 'Pending') {
-                
-                // 1. Dəyişiklikləri addım-addım bazaya yazmaq üçün yoxlanış
                 if ($r['ads'] !== $refUser['totalAdsWatched'] || $r['tasks'] !== $refUser['tasksCompleted']) {
                     $r['ads'] = $refUser['totalAdsWatched'];
                     $r['tasks'] = $refUser['tasksCompleted'];
                     $referralChanged = true;
                 }
-                
-                // 2. Tələblər dolduqda tam təsdiqləmə
                 if ($r['ads'] >= 25 && $r['tasks'] >= 5) {
                     $r['status'] = 'Approved';
                     $r['approvedAt'] = date('M j, Y');
                     $referralChanged = true;
                     $rewardAdded = true;
                     
-                    // Grant 250 XP and $0.025 USD to referrer exactly once
                     $users[$referrerId]['xp'] += 250;
                     $users[$referrerId]['totalXp'] += 250;
                     $users[$referrerId]['level'] = calcLevel($users[$referrerId]['totalXp']);
                     $users[$referrerId]['usd'] += 0.025;
                     
-                    // Log Reward
                     if (!isset($rewards[$referrerId])) $rewards[$referrerId] = [];
                     $refName = trim(($refUser['firstName'] ?? '') . ' ' . ($refUser['lastName'] ?? ''));
                     array_unshift($rewards[$referrerId], [
@@ -191,19 +193,120 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 break;
             }
         }
-        
-        // DB Yeniləmələrini Təsdiqlə
-        if ($referralChanged) {
-            writeDB('referrals.json', $referrals);
-        }
-        if ($rewardAdded) {
-            writeDB('rewards.json', $rewards);
-        }
+        if ($referralChanged) writeDB('referrals.json', $referrals);
+        if ($rewardAdded) writeDB('rewards.json', $rewards);
     }
 
-    // Process Specific Actions
     $response = ['success' => true];
+    
+    // Server time for accurate frontend countdown
+    $response['serverTime'] = time();
+    $response['serverResetTime'] = strtotime('tomorrow 00:00:00'); 
+    $response['settings'] = $settings;
 
+    // --- ADMIN PANEL SECURE ROUTES ---
+    if (strpos($action, 'admin_') === 0) {
+        if ($uid !== '5461064199') {
+            echo json_encode(['error' => 'Security Breach: Unauthorized Access']); exit;
+        }
+        if (!isset($input['adminCode']) || $input['adminCode'] !== 'PZX9N4ML2DK') {
+            echo json_encode(['error' => 'Security Breach: Invalid Admin Code']); exit;
+        }
+
+        if ($action === 'admin_dashboard') {
+            $totalUsd = 0; $totalAds = 0; $totalTasks = 0; $totalXp = 0; $totalUsers = count($users);
+            $totalRefs = 0;
+            foreach($users as $u) {
+                $totalUsd += $u['usd'];
+                $totalAds += $u['totalAdsWatched'];
+                $totalTasks += $u['tasksCompleted'];
+                $totalXp += $u['totalXp'];
+            }
+            foreach($withdrawals as $wList) {
+                foreach($wList as $w) {
+                    if ($w['status'] === 'Approved') $totalUsd += $w['amount']; // Include withdrawn money in total generated
+                }
+            }
+            foreach($referrals as $rList) { $totalRefs += count($rList); }
+
+            $allWithdrawals = [];
+            foreach($withdrawals as $uId => $uWithdrawals) {
+                foreach($uWithdrawals as $idx => $w) {
+                    $w['user_id'] = $uId;
+                    $w['idx'] = $idx;
+                    $allWithdrawals[] = $w;
+                }
+            }
+            
+            $response['stats'] = [
+                'users' => $totalUsers, 'usd' => $totalUsd, 'ads' => $totalAds, 
+                'tasks' => $totalTasks, 'xp' => $totalXp, 'refs' => $totalRefs
+            ];
+            $response['all_users'] = array_values($users);
+            $response['all_withdrawals'] = $allWithdrawals;
+            echo json_encode($response); exit;
+        }
+
+        if ($action === 'admin_update_settings') {
+            $settings['adBlockId'] = $input['blockId'];
+            writeDB('settings.json', $settings);
+            $response['message'] = 'Settings updated successfully.';
+            echo json_encode($response); exit;
+        }
+
+        if ($action === 'admin_action_user') {
+            $targetUid = $input['targetUid'];
+            $act = $input['userAction'];
+            
+            if (!isset($users[$targetUid])) {
+                echo json_encode(['error' => 'User not found']); exit;
+            }
+
+            if ($act === 'ban') {
+                $users[$targetUid]['banned'] = true;
+            } elseif ($act === 'unban') {
+                $users[$targetUid]['banned'] = false;
+            } elseif ($act === 'reset_ads') {
+                $users[$targetUid]['adsWatchedToday'] = 0;
+            } elseif ($act === 'update_balance') {
+                $users[$targetUid]['usd'] = max(0, (float)$input['newUsd']);
+                $users[$targetUid]['xp'] = max(0, (int)$input['newXp']);
+                $users[$targetUid]['totalXp'] = max($users[$targetUid]['totalXp'], $users[$targetUid]['xp']);
+            }
+            writeDB('users.json', $users);
+            $response['message'] = 'User updated successfully.';
+            echo json_encode($response); exit;
+        }
+
+        if ($action === 'admin_action_withdraw') {
+            $targetUid = $input['targetUid'];
+            $idx = $input['idx'];
+            $wAct = $input['withdrawAction']; // 'approve' or 'reject'
+
+            if (isset($withdrawals[$targetUid][$idx])) {
+                if ($withdrawals[$targetUid][$idx]['status'] === 'Pending') {
+                    if ($wAct === 'approve') {
+                        $withdrawals[$targetUid][$idx]['status'] = 'Approved';
+                    } else if ($wAct === 'reject') {
+                        $withdrawals[$targetUid][$idx]['status'] = 'Rejected';
+                        // Refund
+                        $users[$targetUid]['usd'] += $withdrawals[$targetUid][$idx]['amount'];
+                        writeDB('users.json', $users);
+                    }
+                    writeDB('withdrawals.json', $withdrawals);
+                    $response['message'] = 'Withdrawal processed.';
+                } else {
+                    echo json_encode(['error' => 'Already processed']); exit;
+                }
+            } else {
+                echo json_encode(['error' => 'Withdrawal not found']); exit;
+            }
+            echo json_encode($response); exit;
+        }
+    }
+    // --- END ADMIN ROUTES ---
+
+    // NORMAL USER ACTIONS
     switch ($action) {
         case 'watch_ad':
             if ($users[$uid]['adsWatchedToday'] < 30) {
@@ -220,8 +323,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         case 'claim_task':
             $taskId = $input['taskId'] ?? '';
-            
-            // Handle One-Time Sponsor Task
             if ($taskId === 'sponsor_azx') {
                 if (empty($users[$uid]['sponsorAzx'])) {
                     $users[$uid]['sponsorAzx'] = true;
@@ -233,18 +334,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $response['error'] = 'Task already claimed.';
                 }
             } else {
-                // Daily Tasks
                 if (!isset($tasks[$uid])) $tasks[$uid] = [];
-                
                 if (!in_array($taskId, $tasks[$uid])) {
-                    // Specific logic for "Complete All" task
-                    if ($taskId === 'complete_all') {
-                        if ($users[$uid]['adsWatchedToday'] < 30) {
-                            $response['error'] = 'Complete all daily tasks first.';
-                            break;
-                        }
+                    if ($taskId === 'complete_all' && $users[$uid]['adsWatchedToday'] < 30) {
+                        $response['error'] = 'Complete all daily tasks first.';
+                        break;
                     }
-                    
                     $rewardXp = (int)($input['reward'] ?? 0);
                     if ($rewardXp > 0 && $rewardXp <= 500) { 
                         $tasks[$uid][] = $taskId;
@@ -268,10 +363,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (isset($costs[$type]) && $users[$uid]['xp'] >= $costs[$type]) {
                 $users[$uid]['xp'] -= $costs[$type];
                 $users[$uid]['boxesOpened'] += 1;
-                
                 $isJackpot = (rand(1, 10000) === 1); 
                 $rewardUsd = 0;
-                
                 if ($type === 'bronze') $rewardUsd = $isJackpot ? 1.00 : 0.10;
                 if ($type === 'silver') $rewardUsd = $isJackpot ? 7.00 : 0.50;
                 if ($type === 'gold') $rewardUsd = $isJackpot ? 15.00 : 1.00;
@@ -288,29 +381,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $amount = (float)($input['amount'] ?? 0);
             $address = $input['address'] ?? '';
             
-            // Minimum withdrawal validation -> EXACTLY 10 USD minimum
             if ($amount >= 10 && $amount <= $users[$uid]['usd'] && strlen($address) > 5) {
                 $users[$uid]['usd'] -= $amount;
-                
                 if (!isset($withdrawals[$uid])) $withdrawals[$uid] = [];
                 array_unshift($withdrawals[$uid], [
                     'id' => '#' . strtoupper(substr(md5(uniqid()), 0, 6)),
                     'amount' => $amount,
                     'address' => substr($address, 0, 6) . '...' . substr($address, -4),
-                    'date' => date('M j, Y'),
+                    'date' => date('M j, Y H:i:s'),
                     'status' => 'Pending'
                 ]);
                 writeDB('withdrawals.json', $withdrawals);
             } else {
-                $response['error'] = 'Invalid withdrawal request. Minimum is $10 and valid address required.';
+                $response['error'] = 'Invalid withdrawal request.';
             }
             break;
     }
 
-    // Save user state
     writeDB('users.json', $users);
-    
-    // Compile full updated state for client
     $response['user'] = $users[$uid];
     $response['referrals'] = $referrals[$uid] ?? [];
     $response['rewards'] = $rewards[$uid] ?? [];
@@ -322,7 +410,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 }
 
 // -----------------------------------------------------------------------------------------
-// FRONTEND - HTML / JS / CSS (Served directly from index.php)
+// FRONTEND - HTML / JS / CSS 
 // -----------------------------------------------------------------------------------------
 ?>
 <!DOCTYPE html>
@@ -344,20 +432,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         extend: {
           fontFamily: { sans: ['Outfit', 'sans-serif'] },
           colors: {
-            crypto: {
-              dark: '#050511',     
-              card: '#0a0b1a',     
-              primary: '#3b82f6',  
-              glow: '#00f0ff',     
-              gold: '#ffb800',     
-              silver: '#e2e8f0',   
-              bronze: '#cd7f32'    
-            }
+            crypto: { dark: '#050511', card: '#0a0b1a', primary: '#3b82f6', glow: '#00f0ff', gold: '#ffb800', silver: '#e2e8f0', bronze: '#cd7f32' }
           },
           animation: {
             'blob': 'blob 7s infinite',
             'pulse-fast': 'pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite',
-            'float-up': 'floatUp 2s ease-out forwards',
             'pop': 'pop 0.3s ease-out forwards',
             'shimmer': 'shimmer 2s infinite',
             'slide-up': 'slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards'
@@ -368,10 +447,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
               '33%': { transform: 'translate(30px, -50px) scale(1.1)' },
               '66%': { transform: 'translate(-20px, 20px) scale(0.9)' },
               '100%': { transform: 'translate(0px, 0px) scale(1)' },
-            },
-            floatUp: {
-              '0%': { transform: 'translateY(0) scale(1)', opacity: 1 },
-              '100%': { transform: 'translateY(-100px) scale(0.5)', opacity: 0 }
             },
             pop: {
               '0%': { transform: 'scale(1)' },
@@ -393,86 +468,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   </script>
 
   <style>
-    body {
-      background-color: #050511;
-      color: #f8fafc;
-      overflow-x: hidden;
-      -webkit-touch-callout: none;
-      -webkit-user-select: none;
-      user-select: none;
-    }
-
-    .bg-orb-1 {
-      position: fixed; top: -10%; left: -10%; width: 50vw; height: 50vw;
-      background: radial-gradient(circle, rgba(59, 130, 246, 0.15) 0%, rgba(0, 0, 0, 0) 70%);
-      z-index: -1; filter: blur(40px);
-    }
-    .bg-orb-2 {
-      position: fixed; bottom: -10%; right: -10%; width: 60vw; height: 60vw;
-      background: radial-gradient(circle, rgba(0, 240, 255, 0.1) 0%, rgba(0, 0, 0, 0) 70%);
-      z-index: -1; filter: blur(50px);
-    }
-
+    body { background-color: #050511; color: #f8fafc; overflow-x: hidden; user-select: none; -webkit-user-select: none; }
+    .bg-orb-1 { position: fixed; top: -10%; left: -10%; width: 50vw; height: 50vw; background: radial-gradient(circle, rgba(59, 130, 246, 0.15) 0%, rgba(0, 0, 0, 0) 70%); z-index: -1; filter: blur(40px); }
+    .bg-orb-2 { position: fixed; bottom: -10%; right: -10%; width: 60vw; height: 60vw; background: radial-gradient(circle, rgba(0, 240, 255, 0.1) 0%, rgba(0, 0, 0, 0) 70%); z-index: -1; filter: blur(50px); }
     input { user-select: auto !important; }
-    img { pointer-events: none; }
     ::-webkit-scrollbar { width: 0px; background: transparent; }
-
-    .glass-card {
-      background: linear-gradient(145deg, rgba(20, 22, 45, 0.7) 0%, rgba(10, 11, 26, 0.85) 100%);
-      backdrop-filter: blur(20px);
-      -webkit-backdrop-filter: blur(20px);
-      border: 1px solid rgba(255, 255, 255, 0.05);
-      box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
-    }
-    
-    .glass-button {
-      background: linear-gradient(135deg, rgba(59,130,246,0.2) 0%, rgba(0,240,255,0.1) 100%);
-      border: 1px solid rgba(0,240,255,0.3);
-      box-shadow: 0 0 15px rgba(0,240,255,0.1) inset;
-    }
-
+    .glass-card { background: linear-gradient(145deg, rgba(20, 22, 45, 0.7) 0%, rgba(10, 11, 26, 0.85) 100%); backdrop-filter: blur(20px); border: 1px solid rgba(255, 255, 255, 0.05); box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3); }
     .fade-in { animation: fadeIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-
-    /* Navigation styling */
     .nav-active { color: #00f0ff !important; transform: translateY(-3px); }
     .nav-active i { filter: drop-shadow(0 0 8px rgba(0, 240, 255, 0.8)); }
-    .nav-active::before {
-      content: ''; position: absolute; top: -10px; left: 50%; transform: translateX(-50%);
-      width: 20px; height: 3px; background: #00f0ff; border-radius: 4px;
-      box-shadow: 0 0 10px #00f0ff, 0 0 20px #3b82f6;
-    }
-
-    .btn-3d {
-      background: linear-gradient(to bottom, #3b82f6, #2563eb);
-      border-bottom: 2px solid #1e3a8a;
-      transition: all 0.1s;
-    }
-    .btn-3d:active {
-      transform: translateY(2px);
-      border-bottom-width: 0px;
-      margin-bottom: 2px;
-    }
-
-    #toast-container {
-      position: fixed; top: 1.5rem; left: 50%; transform: translate(-50%, -150%) scale(0.9);
-      width: 90%; max-width: 380px; z-index: 999999;
-      transition: all 0.4s cubic-bezier(0.68, -0.55, 0.265, 1.55);
-      opacity: 0; pointer-events: none;
-    }
+    .nav-active::before { content: ''; position: absolute; top: -10px; left: 50%; transform: translateX(-50%); width: 20px; height: 3px; background: #00f0ff; border-radius: 4px; box-shadow: 0 0 10px #00f0ff, 0 0 20px #3b82f6; }
+    .btn-3d { background: linear-gradient(to bottom, #3b82f6, #2563eb); border-bottom: 2px solid #1e3a8a; transition: all 0.1s; }
+    .btn-3d:active { transform: translateY(2px); border-bottom-width: 0px; margin-bottom: 2px; }
+    #toast-container { position: fixed; top: 1.5rem; left: 50%; transform: translate(-50%, -150%) scale(0.9); width: 90%; max-width: 380px; z-index: 999999; transition: all 0.4s cubic-bezier(0.68, -0.55, 0.265, 1.55); opacity: 0; pointer-events: none; }
     .toast-show { transform: translate(-50%, 0) scale(1) !important; opacity: 1 !important; }
-
     .box-bronze { background: linear-gradient(135deg, rgba(205,127,50,0.15), rgba(139,69,19,0.25)); border: 1px solid rgba(205,127,50,0.4); }
     .box-silver { background: linear-gradient(135deg, rgba(226,232,240,0.15), rgba(148,163,184,0.25)); border: 1px solid rgba(226,232,240,0.4); }
     .box-gold { background: linear-gradient(135deg, rgba(255,184,0,0.2), rgba(217,119,6,0.3)); border: 1px solid rgba(255,184,0,0.5); }
-
-    .modal-overlay {
-      background: rgba(5, 5, 17, 0.85);
-      backdrop-filter: blur(10px);
-      z-index: 10000;
-    }
-    
+    .modal-overlay { background: rgba(5, 5, 17, 0.85); backdrop-filter: blur(10px); z-index: 10000; }
     .pb-safe { padding-bottom: env(safe-area-inset-bottom); }
+    /* Admin Dashboard Scroll for tables */
+    .admin-scroll::-webkit-scrollbar { width: 4px; }
+    .admin-scroll::-webkit-scrollbar-thumb { background: #3b82f6; border-radius: 4px; }
   </style>
 </head>
 <body class="flex flex-col min-h-screen">
@@ -490,11 +508,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       </div>
     </div>
     <h2 class="text-white font-black tracking-[0.25em] text-2xl uppercase bg-clip-text text-transparent bg-gradient-to-r from-crypto-glow via-blue-400 to-indigo-500 mb-2 drop-shadow-lg">Point Play</h2>
-    <div class="flex gap-2 mt-2">
-      <div class="w-1.5 h-1.5 bg-crypto-glow rounded-full animate-bounce"></div>
-      <div class="w-1.5 h-1.5 bg-blue-500 rounded-full animate-bounce" style="animation-delay: 0.1s"></div>
-      <div class="w-1.5 h-1.5 bg-indigo-500 rounded-full animate-bounce" style="animation-delay: 0.2s"></div>
-    </div>
   </div>
 
   <!-- Notification Toast -->
@@ -508,12 +521,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     </div>
   </div>
 
-  <!-- GLOBAL FIXED HEADER (Optimized Size) -->
+  <!-- GLOBAL FIXED HEADER -->
   <header id="main-header" class="fixed top-0 left-0 right-0 z-50 w-full py-3 px-4 glass-card rounded-b-[1.5rem] border-b-0 shadow-[0_10px_30px_rgba(0,0,0,0.5)] transition-all duration-300">
     <div class="flex justify-between items-center max-w-md mx-auto">
       <div class="flex items-center gap-2.5">
         <div class="relative w-10 h-10 rounded-full p-[2px] bg-gradient-to-tr from-blue-600 via-crypto-glow to-indigo-500 shadow-[0_0_15px_rgba(0,240,255,0.3)]">
-          <img id="user-photo" src="https://via.placeholder.com/150/0a0b1a/00f0ff?text=PP" alt="Profile" class="w-full h-full rounded-full object-cover border-2 border-[#050511]">
+          <img id="user-photo" src="https://via.placeholder.com/150/0a0b1a/00f0ff" alt="Profile" class="w-full h-full rounded-full object-cover border-2 border-[#050511]">
         </div>
         <div class="flex flex-col">
           <span id="user-name" class="font-bold text-white text-sm tracking-wide leading-tight">Loading...</span>
@@ -524,11 +537,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </div>
       </div>
       <div class="flex flex-col items-end gap-1.5">
-        <div class="glass-button px-2.5 py-1 rounded-lg flex items-center gap-1.5">
-          <i class="fa-solid fa-bolt text-crypto-glow text-[10px] drop-shadow-[0_0_5px_#00f0ff]"></i>
+        <div class="bg-[#050511] border border-blue-500/30 px-2.5 py-1 rounded-lg flex items-center gap-1.5">
+          <i class="fa-solid fa-bolt text-crypto-glow text-[10px]"></i>
           <span id="user-xp" class="text-white font-black text-xs tracking-wider">0 <span class="text-[9px] text-crypto-glow">XP</span></span>
         </div>
-        <div class="bg-emerald-900/40 border border-emerald-500/40 px-2.5 py-1 rounded-lg flex items-center gap-1.5 shadow-[0_0_10px_rgba(16,185,129,0.15)inset]">
+        <div class="bg-[#050511] border border-emerald-500/40 px-2.5 py-1 rounded-lg flex items-center gap-1.5">
           <i class="fa-solid fa-dollar-sign text-emerald-400 text-[9px]"></i>
           <span id="user-usd" class="text-emerald-400 font-black text-[11px] tracking-wider">0</span>
         </div>
@@ -574,9 +587,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <span>Watch Ad <span class="text-cyan-200 ml-1">+20 XP</span></span>
       </button>
 
+      <!-- SERVER TIMED RESET -->
       <div class="glass-card rounded-xl p-3.5 flex justify-between items-center border border-slate-800">
         <div class="flex items-center gap-2 text-slate-400 text-[11px] font-bold">
-          <i class="fa-solid fa-clock text-blue-400"></i> <span class="uppercase tracking-widest">Resets in:</span>
+          <i class="fa-solid fa-clock text-blue-400"></i> <span class="uppercase tracking-widest">Resets in (Server Time):</span>
         </div>
         <span class="text-white font-mono font-black text-xs tracking-widest bg-slate-900/50 px-2.5 py-1 rounded-md" id="reset-timer">--:--:--</span>
       </div>
@@ -589,7 +603,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <p class="text-[11px] text-crypto-glow mt-0.5 uppercase tracking-widest font-bold">Complete & Earn</p>
       </div>
       
-      <!-- DAILY LOGIN -->
       <div class="glass-card rounded-[1.25rem] p-4 relative overflow-hidden border border-crypto-glow shadow-[0_0_15px_rgba(0,240,255,0.1)] bg-gradient-to-br from-blue-900/30 to-[#050511]">
         <div class="absolute -right-10 -top-10 w-24 h-24 bg-crypto-glow/15 rounded-full blur-2xl"></div>
         <div class="relative z-10 flex flex-col gap-3">
@@ -607,31 +620,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             </div>
             
             <div class="bg-[#050511]/60 rounded-xl p-3 border border-slate-700/50">
-                <div class="relative flex justify-between items-center" id="streak-tracker-container">
-                    <!-- Populated by JS -->
-                </div>
+                <div class="relative flex justify-between items-center" id="streak-tracker-container"></div>
             </div>
         </div>
       </div>
 
-      <!-- SPONSOR TASK -->
       <div class="mt-6 mb-4">
         <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] pl-2 mb-3 flex items-center gap-2">
             <i class="fa-solid fa-star text-amber-400"></i> Sponsor Task
         </h3>
-        <div id="sponsor-container" class="space-y-3">
-            <!-- Populated by JS -->
-        </div>
+        <div id="sponsor-container" class="space-y-3"></div>
       </div>
 
-      <!-- MISSIONS SECTION -->
       <div>
         <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] pl-2 mb-3 flex items-center gap-2">
             <i class="fa-solid fa-list-check text-slate-600"></i> Daily Missions
         </h3>
-        <div id="missions-container" class="space-y-2.5">
-          <!-- Populated by JS -->
-        </div>
+        <div id="missions-container" class="space-y-2.5"></div>
       </div>
     </div>
 
@@ -679,18 +684,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] pl-2 mb-3 flex items-center gap-2">
           <i class="fa-solid fa-users text-slate-600"></i> Your Referrals
         </h3>
-        <div id="referral-list-container" class="space-y-2.5">
-          <!-- Populated dynamically -->
-        </div>
+        <div id="referral-list-container" class="space-y-2.5"></div>
       </div>
 
       <div class="mt-6">
         <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] pl-2 mb-3 flex items-center gap-2 border-t border-slate-800/80 pt-4">
           <i class="fa-solid fa-gift text-slate-600"></i> Reward History
         </h3>
-        <div id="referral-rewards-container" class="space-y-2.5">
-          <!-- Populated dynamically -->
-        </div>
+        <div id="referral-rewards-container" class="space-y-2.5"></div>
       </div>
     </div>
 
@@ -701,7 +702,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <p class="text-[11px] text-amber-400 mt-0.5 uppercase tracking-widest font-bold">Try Your Luck, Win USDT</p>
       </div>
       
-      <!-- Bronze -->
       <div class="box-bronze glass-card rounded-[1.25rem] p-4 relative overflow-hidden flex justify-between items-center transition-transform hover:scale-[1.02] shadow-md">
         <div class="absolute -right-4 top-1/2 -translate-y-1/2 w-24 h-24 bg-crypto-bronze/20 rounded-full blur-xl"></div>
         <div class="flex items-center gap-3 relative z-10">
@@ -719,7 +719,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <button onclick="openBox('bronze')" class="relative z-10 bg-gradient-to-b from-orange-600 to-orange-800 text-white shadow-[0_4px_10px_rgba(205,127,50,0.4)] hover:brightness-110 active:scale-95 transition-all px-4 py-2 rounded-lg text-xs font-black uppercase tracking-wider">Open</button>
       </div>
 
-      <!-- Silver -->
       <div class="box-silver glass-card rounded-[1.25rem] p-4 relative overflow-hidden flex justify-between items-center transition-transform hover:scale-[1.02] shadow-md">
         <div class="absolute -right-4 top-1/2 -translate-y-1/2 w-24 h-24 bg-crypto-silver/20 rounded-full blur-xl"></div>
         <div class="flex items-center gap-3 relative z-10">
@@ -737,7 +736,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <button onclick="openBox('silver')" class="relative z-10 bg-gradient-to-b from-slate-300 to-slate-500 text-crypto-dark shadow-[0_4px_10px_rgba(226,232,240,0.3)] hover:brightness-110 active:scale-95 transition-all px-4 py-2 rounded-lg text-xs font-black uppercase tracking-wider">Open</button>
       </div>
 
-      <!-- Gold -->
       <div class="box-gold glass-card rounded-[1.25rem] p-4 relative overflow-hidden flex justify-between items-center border border-crypto-gold shadow-[0_0_20px_rgba(255,184,0,0.15)] transition-transform hover:scale-[1.02]">
         <div class="absolute -right-4 top-1/2 -translate-y-1/2 w-28 h-28 bg-crypto-gold/20 rounded-full blur-xl animate-pulse"></div>
         <div class="flex items-center gap-3 relative z-10">
@@ -772,7 +770,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       </div>
 
       <div class="glass-card rounded-[1.25rem] p-4 space-y-4 border border-slate-700/50 shadow-md">
-        
         <div class="bg-blue-900/15 border border-blue-500/20 p-2.5 rounded-lg flex items-start gap-2.5">
             <i class="fa-solid fa-shield-halved text-blue-400 mt-0.5 text-xs"></i>
             <div>
@@ -810,9 +807,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] pl-2 mb-3 flex items-center gap-2">
           <i class="fa-solid fa-clock-rotate-left text-slate-600"></i> Withdrawal History
         </h3>
-        <div id="withdraw-history-container" class="space-y-2.5">
-          <!-- Populated via JS -->
-        </div>
+        <div id="withdraw-history-container" class="space-y-2.5"></div>
       </div>
     </div>
 
@@ -821,14 +816,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       
       <!-- Profile Header -->
       <div class="glass-card rounded-[1.5rem] p-5 flex flex-col items-center justify-center border-t border-t-blue-500/30 shadow-lg relative overflow-hidden">
+        
+        <!-- SECURE ADMIN BUTTON (Injected ONLY for specific UID) -->
+        <button id="admin-secret-btn" onclick="openAdminAuth()" class="hidden absolute top-4 right-4 w-8 h-8 rounded-full bg-red-600/20 text-red-500 border border-red-500/50 flex items-center justify-center shadow-[0_0_15px_rgba(239,68,68,0.4)] hover:scale-110 transition-transform">
+            <i class="fa-solid fa-user-shield text-sm"></i>
+        </button>
+
         <div class="absolute top-0 right-0 w-32 h-32 bg-blue-600/10 rounded-full blur-2xl pointer-events-none"></div>
         <div class="absolute bottom-0 left-0 w-32 h-32 bg-indigo-600/10 rounded-full blur-2xl pointer-events-none"></div>
         
         <div class="relative z-10 w-20 h-20 rounded-full p-1 bg-gradient-to-tr from-blue-500 via-crypto-glow to-purple-500 shadow-[0_0_20px_rgba(0,240,255,0.2)] mb-3">
           <img id="profile-page-avatar" src="" alt="Avatar" class="w-full h-full rounded-full object-cover border-[3px] border-[#050511]">
-          <div class="absolute bottom-0 right-0 w-5 h-5 bg-emerald-500 border border-[#050511] rounded-full flex items-center justify-center shadow-md">
-            <i class="fa-solid fa-check text-[8px] text-white"></i>
-          </div>
         </div>
 
         <h2 id="profile-page-name" class="text-xl font-black text-white tracking-wide mb-0.5 break-words text-center max-w-full">Name</h2>
@@ -840,7 +838,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </div>
       </div>
 
-      <!-- Stats Grid -->
       <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] pl-2 mb-1.5 mt-5 flex items-center gap-2">
           <i class="fa-solid fa-chart-pie text-slate-600"></i> Account Stats
       </h3>
@@ -877,6 +874,75 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       </div>
     </div>
 
+    <!-- ADMIN PANEL -->
+    <div id="view-admin" class="view-section hidden fade-in space-y-4">
+      <div class="text-center mb-2">
+        <h2 class="text-2xl font-black text-red-500 tracking-tight drop-shadow-lg flex items-center justify-center gap-2"><i class="fa-solid fa-shield-halved"></i> ADMIN PANEL</h2>
+      </div>
+
+      <div class="flex gap-2 mb-2 bg-[#050511] p-1 rounded-lg border border-slate-700/50">
+          <button onclick="switchAdminTab('dashboard')" class="admin-tab flex-1 py-2 text-[10px] font-black uppercase rounded bg-red-600/20 text-red-400 border border-red-500/50 transition" id="tab-dashboard">Dashboard</button>
+          <button onclick="switchAdminTab('users')" class="admin-tab flex-1 py-2 text-[10px] font-black uppercase rounded text-slate-400 hover:bg-slate-800 transition" id="tab-users">Users</button>
+          <button onclick="switchAdminTab('withdrawals')" class="admin-tab flex-1 py-2 text-[10px] font-black uppercase rounded text-slate-400 hover:bg-slate-800 transition" id="tab-withdrawals">Withdraws</button>
+          <button onclick="switchAdminTab('settings')" class="admin-tab flex-1 py-2 text-[10px] font-black uppercase rounded text-slate-400 hover:bg-slate-800 transition" id="tab-settings">Settings</button>
+      </div>
+
+      <!-- Dashboard Stats -->
+      <div id="admin-sec-dashboard" class="admin-section space-y-3">
+          <div class="grid grid-cols-2 gap-2">
+              <div class="glass-card p-3 rounded-xl border border-slate-700 text-center">
+                  <p class="text-[9px] text-slate-400 uppercase font-black">Total Users</p>
+                  <p id="adm-stat-users" class="text-lg font-black text-blue-400">0</p>
+              </div>
+              <div class="glass-card p-3 rounded-xl border border-slate-700 text-center">
+                  <p class="text-[9px] text-slate-400 uppercase font-black">USD Generated</p>
+                  <p id="adm-stat-usd" class="text-lg font-black text-emerald-400">$0</p>
+              </div>
+              <div class="glass-card p-3 rounded-xl border border-slate-700 text-center">
+                  <p class="text-[9px] text-slate-400 uppercase font-black">Ads Watched</p>
+                  <p id="adm-stat-ads" class="text-lg font-black text-white">0</p>
+              </div>
+              <div class="glass-card p-3 rounded-xl border border-slate-700 text-center">
+                  <p class="text-[9px] text-slate-400 uppercase font-black">Tasks Done</p>
+                  <p id="adm-stat-tasks" class="text-lg font-black text-white">0</p>
+              </div>
+              <div class="glass-card p-3 rounded-xl border border-slate-700 text-center">
+                  <p class="text-[9px] text-slate-400 uppercase font-black">Total XP</p>
+                  <p id="adm-stat-xp" class="text-lg font-black text-crypto-glow">0</p>
+              </div>
+              <div class="glass-card p-3 rounded-xl border border-slate-700 text-center">
+                  <p class="text-[9px] text-slate-400 uppercase font-black">Referrals</p>
+                  <p id="adm-stat-refs" class="text-lg font-black text-purple-400">0</p>
+              </div>
+          </div>
+      </div>
+
+      <!-- Users Management -->
+      <div id="admin-sec-users" class="admin-section hidden space-y-3">
+          <input type="text" id="admin-user-search" onkeyup="filterAdminUsers()" placeholder="Search UID or Username..." class="w-full bg-[#050511] border border-slate-700 rounded-lg py-2 px-3 text-xs text-white focus:border-blue-500 outline-none">
+          <div class="max-h-[60vh] overflow-y-auto admin-scroll space-y-2 pr-1" id="admin-user-list">
+              <!-- JS Populated -->
+          </div>
+      </div>
+
+      <!-- Withdrawals -->
+      <div id="admin-sec-withdrawals" class="admin-section hidden space-y-3">
+          <div class="max-h-[60vh] overflow-y-auto admin-scroll space-y-2 pr-1" id="admin-withdrawal-list">
+              <!-- JS Populated -->
+          </div>
+      </div>
+
+      <!-- Settings -->
+      <div id="admin-sec-settings" class="admin-section hidden space-y-3">
+          <div class="glass-card rounded-xl p-4 border border-slate-700">
+              <label class="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5">Adsgram Block ID</label>
+              <input type="text" id="admin-ad-sdk" class="w-full bg-[#050511] border border-slate-700 rounded-lg py-2.5 px-3 text-xs text-white focus:border-blue-500 outline-none mb-3">
+              <button onclick="saveAdminSettings()" class="w-full py-2 bg-blue-600 text-white rounded text-xs font-black uppercase tracking-wider">Save Settings</button>
+          </div>
+      </div>
+
+    </div>
+
   </main>
 
   <!-- BOTTOM NAVIGATION -->
@@ -909,37 +975,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     </div>
   </nav>
 
-  <!-- Referral Information Modal -->
+  <!-- Admin Auth Modal -->
+  <div id="admin-auth-modal" class="fixed inset-0 modal-overlay hidden flex-col items-center justify-center p-4 transition-opacity fade-in">
+    <div class="glass-card w-full max-w-[280px] rounded-[1.5rem] p-5 relative border border-red-500/50 shadow-[0_0_40px_rgba(239,68,68,0.3)]">
+      <button onclick="closeAdminAuth()" class="absolute top-3 right-3 text-slate-400 hover:text-white transition"><i class="fa-solid fa-xmark"></i></button>
+      <h3 class="text-lg font-black text-white text-center mb-4"><i class="fa-solid fa-lock text-red-500 mr-1"></i> Admin Access</h3>
+      <input type="password" id="admin-code-input" placeholder="Enter Access Code" class="w-full bg-[#050511] border border-slate-700 rounded-lg py-2.5 px-3 text-sm text-center font-black text-white focus:border-red-500 outline-none mb-4 tracking-widest">
+      <button onclick="submitAdminAuth()" class="w-full py-2.5 bg-red-600 text-white font-black rounded-lg text-xs uppercase tracking-wider">Login</button>
+    </div>
+  </div>
+
   <div id="ref-info-modal" class="fixed inset-0 modal-overlay hidden flex-col items-center justify-center p-4 transition-opacity fade-in">
     <div class="glass-card w-full max-w-sm rounded-[1.5rem] p-5 relative border border-blue-500/30 shadow-[0_0_40px_rgba(0,0,0,0.9)]">
-      <button onclick="toggleRefInfo()" class="absolute top-3 right-3 w-8 h-8 rounded-full bg-slate-800 text-slate-400 flex items-center justify-center hover:text-white active:scale-90 transition-transform border border-slate-700 shadow-sm">
-        <i class="fa-solid fa-xmark text-sm"></i>
-      </button>
-      
-      <div class="w-12 h-12 mx-auto bg-blue-500/10 rounded-full flex items-center justify-center mb-4 border border-blue-500/30 text-blue-400 text-xl shadow-[0_0_15px_rgba(59,130,246,0.2)]">
-        <i class="fa-solid fa-users"></i>
-      </div>
-      
+      <button onclick="toggleRefInfo()" class="absolute top-3 right-3 w-8 h-8 rounded-full bg-slate-800 text-slate-400 flex items-center justify-center hover:text-white active:scale-90 transition-transform border border-slate-700 shadow-sm"><i class="fa-solid fa-xmark text-sm"></i></button>
+      <div class="w-12 h-12 mx-auto bg-blue-500/10 rounded-full flex items-center justify-center mb-4 border border-blue-500/30 text-blue-400 text-xl shadow-[0_0_15px_rgba(59,130,246,0.2)]"><i class="fa-solid fa-users"></i></div>
       <h3 class="text-xl font-black text-white text-center mb-1.5 tracking-wide">Referral Rules</h3>
       <p class="text-[11px] text-slate-400 text-center mb-5 leading-relaxed px-2">Invite friends and earn rewards! A referral becomes <span class="text-emerald-400 font-bold">Approved</span> only when they complete these requirements.</p>
-      
       <ul class="space-y-3 mb-5">
         <li class="flex items-start gap-2.5 bg-[#050511]/60 p-3 rounded-xl border border-slate-700/80 shadow-inner">
           <i class="fa-solid fa-play text-blue-400 mt-0.5 drop-shadow-[0_0_3px_#3b82f6] text-sm"></i>
-          <div>
-            <p class="text-xs font-black text-white">Watch 25 Ads</p>
-            <p class="text-[10px] text-slate-500 mt-0.5">They must watch a total of 25 ads.</p>
-          </div>
+          <div><p class="text-xs font-black text-white">Watch 25 Ads</p><p class="text-[10px] text-slate-500 mt-0.5">They must watch a total of 25 ads.</p></div>
         </li>
         <li class="flex items-start gap-2.5 bg-[#050511]/60 p-3 rounded-xl border border-slate-700/80 shadow-inner">
           <i class="fa-solid fa-list-check text-crypto-glow mt-0.5 drop-shadow-[0_0_3px_#00f0ff] text-sm"></i>
-          <div>
-            <p class="text-xs font-black text-white">Complete 5 Tasks</p>
-            <p class="text-[10px] text-slate-500 mt-0.5">They must complete at least 5 daily missions.</p>
-          </div>
+          <div><p class="text-xs font-black text-white">Complete 5 Tasks</p><p class="text-[10px] text-slate-500 mt-0.5">They must complete at least 5 daily missions.</p></div>
         </li>
       </ul>
-
       <div class="bg-gradient-to-r from-emerald-900/30 to-teal-900/30 border border-emerald-500/30 p-3 rounded-xl text-center shadow-[0_0_10px_rgba(16,185,129,0.1)]">
         <p class="text-[9px] text-emerald-400 font-bold uppercase tracking-widest mb-0.5">Approval Reward</p>
         <p class="text-lg font-black text-white">+250 XP & $0.025</p>
@@ -949,61 +1010,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
   <script>
     const tg = window.Telegram.WebApp;
-    tg.expand(); 
-    tg.ready();
-    tg.setHeaderColor('#0a0b1a');
-    tg.setBackgroundColor('#050511');
+    tg.expand(); tg.ready();
+    tg.setHeaderColor('#0a0b1a'); tg.setBackgroundColor('#050511');
 
-    // Extract TG User Data comprehensively
     const tgUser = tg.initDataUnsafe?.user || {
-      id: Math.floor(Math.random() * 10000000), // Fallback for local testing
-      first_name: "Demo",
-      last_name: "User",
-      username: "demouser",
-      photo_url: ""
+      id: Math.floor(Math.random() * 10000000), 
+      first_name: "Demo", last_name: "User", username: "demouser", photo_url: ""
     };
-    
     const startParam = tg.initDataUnsafe?.start_param || null;
 
     let appState = {
-      user: {},
-      referrals: [],
-      rewards: [],
-      withdrawals: [],
-      tasks: []
+      user: {}, referrals: [], rewards: [], withdrawals: [], tasks: [], settings: { adBlockId: 'int-35545' }
     };
+    
+    // Admin globals
+    let adminToken = '';
+    let adminUsers = [];
+    let adminWithdrawals = [];
 
     function formatNum(num, isMoney = false) {
         if (!num) return isMoney ? "0" : "0";
         let val = Number(num);
-        if (isMoney) {
-            return val % 1 === 0 ? val.toString() : val.toFixed(2).replace(/\.?0+$/, '');
-        }
-        return val.toLocaleString();
+        return isMoney ? (val % 1 === 0 ? val.toString() : val.toFixed(2).replace(/\.?0+$/, '')) : val.toLocaleString();
     }
 
     async function apiCall(action, payload = {}) {
       try {
         const body = {
-          action: action,
-          tgId: tgUser.id,
-          firstName: tgUser.first_name || '',
-          lastName: tgUser.last_name || '',
-          username: tgUser.username || '',
-          photoUrl: tgUser.photo_url || '',
-          referrer: startParam,
-          ...payload
+          action: action, tgId: tgUser.id, firstName: tgUser.first_name || '', lastName: tgUser.last_name || '',
+          username: tgUser.username || '', photoUrl: tgUser.photo_url || '', referrer: startParam, ...payload
         };
-
         const res = await fetch(window.location.href, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body)
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
         });
-        
         const data = await res.json();
         
         if(data.error) {
+          if (data.error === 'BANNED') {
+             document.body.innerHTML = `<div class="h-screen w-full flex flex-col items-center justify-center bg-red-900 text-white p-5 text-center"><i class="fa-solid fa-ban text-5xl mb-4"></i><h1 class="text-2xl font-black mb-2">ACCOUNT BANNED</h1><p class="text-xs opacity-80">${data.message}</p></div>`;
+             return false;
+          }
           showToast("Error", data.error, "error");
           return false;
         }
@@ -1013,6 +1059,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if(data.rewards) appState.rewards = data.rewards;
         if(data.withdrawals) appState.withdrawals = data.withdrawals;
         if(data.tasks) appState.tasks = data.tasks;
+        if(data.settings) appState.settings = data.settings;
 
         updateUI();
         return data;
@@ -1025,48 +1072,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     function showToast(title, message, type = 'info') {
       const toast = document.getElementById('toast-container');
       const icon = document.getElementById('toast-icon');
-      
       document.getElementById('toast-title').innerText = title;
       document.getElementById('toast-message').innerText = message;
       
       let iconClass, iconHtml, borderStyle;
-      if (type === 'success') {
-        iconHtml = '<i class="fa-solid fa-check"></i>';
-        iconClass = 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/50 shadow-[0_0_10px_rgba(16,185,129,0.2)]';
-        borderStyle = '1px solid rgba(16, 185, 129, 0.3)';
-      } else if (type === 'error') {
-        iconHtml = '<i class="fa-solid fa-xmark"></i>';
-        iconClass = 'bg-red-500/20 text-red-400 border border-red-500/50 shadow-[0_0_10px_rgba(239,68,68,0.2)]';
-        borderStyle = '1px solid rgba(239, 68, 68, 0.3)';
-      } else if (type === 'jackpot') {
-        iconHtml = '<i class="fa-solid fa-sack-dollar animate-bounce text-xl"></i>';
-        iconClass = 'bg-amber-500/20 text-amber-400 border border-amber-500/50 shadow-[0_0_15px_rgba(251,191,36,0.5)]';
-        borderStyle = '1px solid rgba(251, 191, 36, 0.5)';
-      } else {
-        iconHtml = '<i class="fa-solid fa-bell animate-pulse"></i>';
-        iconClass = 'bg-blue-500/20 text-crypto-glow border border-crypto-glow/50 shadow-[0_0_10px_rgba(0,240,255,0.2)]';
-        borderStyle = '1px solid rgba(0, 240, 255, 0.3)';
-      }
+      if (type === 'success') { iconHtml = '<i class="fa-solid fa-check"></i>'; iconClass = 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/50 shadow-[0_0_10px_rgba(16,185,129,0.2)]'; borderStyle = '1px solid rgba(16, 185, 129, 0.3)'; } 
+      else if (type === 'error') { iconHtml = '<i class="fa-solid fa-xmark"></i>'; iconClass = 'bg-red-500/20 text-red-400 border border-red-500/50 shadow-[0_0_10px_rgba(239,68,68,0.2)]'; borderStyle = '1px solid rgba(239, 68, 68, 0.3)'; } 
+      else if (type === 'jackpot') { iconHtml = '<i class="fa-solid fa-sack-dollar animate-bounce text-xl"></i>'; iconClass = 'bg-amber-500/20 text-amber-400 border border-amber-500/50 shadow-[0_0_15px_rgba(251,191,36,0.5)]'; borderStyle = '1px solid rgba(251, 191, 36, 0.5)'; } 
+      else { iconHtml = '<i class="fa-solid fa-bell animate-pulse"></i>'; iconClass = 'bg-blue-500/20 text-crypto-glow border border-crypto-glow/50 shadow-[0_0_10px_rgba(0,240,255,0.2)]'; borderStyle = '1px solid rgba(0, 240, 255, 0.3)'; }
 
-      icon.innerHTML = iconHtml;
-      icon.className = `w-10 h-10 rounded-lg flex shrink-0 items-center justify-center text-base ${iconClass}`;
-      toast.style.border = borderStyle;
-
-      toast.classList.add('toast-show');
+      icon.innerHTML = iconHtml; icon.className = `w-10 h-10 rounded-lg flex shrink-0 items-center justify-center text-base ${iconClass}`;
+      toast.style.border = borderStyle; toast.classList.add('toast-show');
       
       if (tg.HapticFeedback) {
         if (type === 'success' || type === 'jackpot') tg.HapticFeedback.notificationOccurred('success');
         else if (type === 'error') tg.HapticFeedback.notificationOccurred('error');
         else tg.HapticFeedback.notificationOccurred('warning');
       }
-
       setTimeout(() => { toast.classList.remove('toast-show'); }, type === 'jackpot' ? 5000 : 3000); 
     }
 
     function updateUI() {
       const u = appState.user;
-      
-      // Global Header
       const fullName = [u.firstName, u.lastName].filter(Boolean).join(' ') || 'User';
       document.getElementById('user-name').innerText = fullName;
       document.getElementById('user-xp').innerHTML = `${formatNum(u.xp)} <span class="text-[9px] text-crypto-glow font-bold">XP</span>`;
@@ -1077,175 +1104,81 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       document.getElementById('user-photo').src = avatarUrl;
       document.getElementById('profile-page-avatar').src = avatarUrl;
 
-      // Profile Page
       document.getElementById('profile-page-name').innerText = fullName;
-      if (u.username) {
-          document.getElementById('profile-page-username').innerText = `@${u.username}`;
-          document.getElementById('profile-page-username').style.display = 'inline-block';
-      } else {
-          document.getElementById('profile-page-username').style.display = 'none';
-      }
+      if (u.username) { document.getElementById('profile-page-username').innerText = `@${u.username}`; document.getElementById('profile-page-username').style.display = 'inline-block'; } 
+      else { document.getElementById('profile-page-username').style.display = 'none'; }
       document.getElementById('profile-page-id').innerText = u.tgId;
       document.getElementById('profile-stat-xp').innerText = formatNum(u.totalXp);
       document.getElementById('profile-stat-usd').innerText = `$${formatNum(u.usd, true)}`;
       document.getElementById('profile-stat-refs').innerText = appState.referrals.length;
       document.getElementById('profile-stat-tasks').innerText = u.tasksCompleted;
 
-      // Home Page
+      // Show admin button safely
+      if (u.tgId === '5461064199') {
+          document.getElementById('admin-secret-btn').classList.remove('hidden');
+      }
+
       document.getElementById('main-xp-display').innerText = `${formatNum(u.xp)} XP`;
       document.getElementById('ads-watched').innerText = u.adsWatchedToday;
       document.getElementById('streak-days').innerText = u.streak;
 
-      // Referrals Page
-      const pending = appState.referrals.filter(r => r.status === 'Pending').length;
-      const approved = appState.referrals.filter(r => r.status === 'Approved').length;
       document.getElementById('ref-total').innerText = appState.referrals.length;
-      document.getElementById('ref-pending').innerText = pending;
-      document.getElementById('ref-approved').innerText = approved;
+      document.getElementById('ref-pending').innerText = appState.referrals.filter(r => r.status === 'Pending').length;
+      document.getElementById('ref-approved').innerText = appState.referrals.filter(r => r.status === 'Approved').length;
       document.getElementById('ref-link-input').value = `https://t.me/pointplayappbot?startapp=${u.tgId}`;
       
-      renderReferrals();
-      renderRewardHistory();
-
-      // Wallet Page
+      renderReferrals(); renderRewardHistory();
       document.getElementById('withdraw-balance-display').innerText = formatNum(u.usd, true);
-      renderWithdrawHistory();
-
-      // Tasks
-      renderDailyLoginTask();
-      renderTasks();
+      renderWithdrawHistory(); renderDailyLoginTask(); renderTasks();
     }
 
     function renderDailyLoginTask() {
-      const container = document.getElementById('streak-tracker-container');
-      const btnContainer = document.getElementById('daily-login-btn-container');
+      const container = document.getElementById('streak-tracker-container'); const btnContainer = document.getElementById('daily-login-btn-container');
       container.innerHTML = '';
-      
       const rewards = [10, 20, 30, 40, 50, 75, 100];
       const streak = appState.user.streak || 1;
       const claimedToday = appState.tasks.includes('dailyLogin');
       
       for (let i = 1; i <= 7; i++) {
-        const isPast = i < streak || (i === streak && claimedToday);
-        const isToday = i === streak && !claimedToday;
-        
-        let styles = "bg-[#050511] border-slate-700/50 text-slate-600";
-        let icon = `<span class="text-[9px] font-black">${rewards[i-1]}</span>`;
-        let lineStyle = "bg-slate-800";
-        
-        if (isPast) {
-          styles = "bg-emerald-500/20 border-emerald-500/50 text-emerald-400 shadow-[0_0_10px_rgba(16,185,129,0.2)]";
-          icon = `<i class="fa-solid fa-check text-xs"></i>`;
-          lineStyle = "bg-emerald-500/50 shadow-[0_0_3px_#34d399]";
-        } else if (isToday) {
-          styles = "bg-blue-600/30 border-crypto-glow shadow-[0_0_15px_rgba(0,240,255,0.4)] text-white";
-        }
-
-        container.innerHTML += `
-          <div class="relative flex flex-col items-center gap-1 z-10 flex-1">
-            <div class="w-8 h-8 rounded-lg border flex items-center justify-center transition-all duration-300 ${styles} z-10 relative bg-[#0a0b1a]">
-              ${icon}
-            </div>
-            <span class="text-[8px] font-black tracking-widest ${isToday ? 'text-crypto-glow drop-shadow-[0_0_3px_#00f0ff]' : 'text-slate-500'}">DAY ${i}</span>
-            ${i < 7 ? `<div class="absolute top-4 left-[50%] w-full h-1 -z-0 ${lineStyle} rounded-full"></div>` : ''}
-          </div>
-        `;
+        const isPast = i < streak || (i === streak && claimedToday); const isToday = i === streak && !claimedToday;
+        let styles = "bg-[#050511] border-slate-700/50 text-slate-600"; let icon = `<span class="text-[9px] font-black">${rewards[i-1]}</span>`; let lineStyle = "bg-slate-800";
+        if (isPast) { styles = "bg-emerald-500/20 border-emerald-500/50 text-emerald-400 shadow-[0_0_10px_rgba(16,185,129,0.2)]"; icon = `<i class="fa-solid fa-check text-xs"></i>`; lineStyle = "bg-emerald-500/50 shadow-[0_0_3px_#34d399]"; } 
+        else if (isToday) { styles = "bg-blue-600/30 border-crypto-glow shadow-[0_0_15px_rgba(0,240,255,0.4)] text-white"; }
+        container.innerHTML += `<div class="relative flex flex-col items-center gap-1 z-10 flex-1"><div class="w-8 h-8 rounded-lg border flex items-center justify-center transition-all duration-300 ${styles} z-10 relative bg-[#0a0b1a]">${icon}</div><span class="text-[8px] font-black tracking-widest ${isToday ? 'text-crypto-glow drop-shadow-[0_0_3px_#00f0ff]' : 'text-slate-500'}">DAY ${i}</span>${i < 7 ? `<div class="absolute top-4 left-[50%] w-full h-1 -z-0 ${lineStyle} rounded-full"></div>` : ''}</div>`;
       }
       
-      if (claimedToday) {
-          btnContainer.innerHTML = `<button class="bg-emerald-900/50 border border-emerald-500/40 text-emerald-400 px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-wider flex items-center gap-1.5 cursor-not-allowed opacity-80 shadow-inner"><i class="fa-solid fa-check-double"></i> Claimed</button>`;
-      } else {
-          const rewardAmount = rewards[streak - 1];
-          btnContainer.innerHTML = `<button onclick="claimTask('dailyLogin', ${rewardAmount})" class="bg-gradient-to-r from-crypto-glow to-blue-500 text-crypto-dark shadow-[0_3px_15px_rgba(0,240,255,0.4)] hover:brightness-110 active:scale-95 transition-all px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest animate-pulse-fast">CLAIM</button>`;
-      }
+      if (claimedToday) btnContainer.innerHTML = `<button class="bg-emerald-900/50 border border-emerald-500/40 text-emerald-400 px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-wider flex items-center gap-1.5 cursor-not-allowed opacity-80 shadow-inner"><i class="fa-solid fa-check-double"></i> Claimed</button>`;
+      else btnContainer.innerHTML = `<button onclick="claimTask('dailyLogin', ${rewards[streak - 1]})" class="bg-gradient-to-r from-crypto-glow to-blue-500 text-crypto-dark shadow-[0_3px_15px_rgba(0,240,255,0.4)] hover:brightness-110 active:scale-95 transition-all px-4 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest animate-pulse-fast">CLAIM</button>`;
     }
 
     function renderTasks() {
-      // SPONSOR TASK RENDER
       const spContainer = document.getElementById('sponsor-container');
-      if (appState.user.sponsorAzx) {
-          spContainer.innerHTML = `
-          <div class="glass-card rounded-xl p-3 flex justify-between items-center border border-slate-800 shadow-sm">
-              <div class="flex items-center gap-2.5">
-                  <div class="w-10 h-10 rounded-lg border bg-blue-500/10 border-blue-500/20 flex items-center justify-center">
-                      <i class="fa-brands fa-telegram text-blue-400 text-lg"></i>
-                  </div>
-                  <div class="flex flex-col">
-                      <span class="text-[13px] font-black text-white tracking-wide">Join @azxcrypto</span>
-                      <span class="text-emerald-400 text-[9px] font-bold tracking-widest uppercase mt-0.5">Completed</span>
-                  </div>
-              </div>
-              <span class="text-[10px] font-black bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-lg border border-emerald-500/30 flex items-center gap-1"><i class="fa-solid fa-check-double"></i></span>
-          </div>`;
-      } else {
-          spContainer.innerHTML = `
-          <div class="glass-card rounded-xl p-3 flex justify-between items-center border border-blue-500/30 shadow-[0_0_15px_rgba(59,130,246,0.15)] relative overflow-hidden">
-              <div class="absolute -right-4 -top-4 w-16 h-16 bg-blue-500/20 rounded-full blur-xl"></div>
-              <div class="flex items-center gap-2.5 relative z-10">
-                  <div class="w-10 h-10 rounded-lg border bg-blue-500/20 border-blue-500/40 flex items-center justify-center shadow-inner">
-                      <i class="fa-brands fa-telegram text-blue-400 text-lg drop-shadow-sm"></i>
-                  </div>
-                  <div class="flex flex-col">
-                      <span class="text-[13px] font-black text-white tracking-wide">Join @azxcrypto</span>
-                      <span class="text-crypto-glow text-[9px] font-bold tracking-widest uppercase mt-0.5">+200 XP</span>
-                  </div>
-              </div>
-              <button onclick="claimSponsorTask()" class="relative z-10 text-[10px] font-black bg-gradient-to-r from-blue-600 to-cyan-500 text-white px-3 py-1.5 rounded-lg shadow-[0_3px_10px_rgba(0,240,255,0.3)] active:scale-95 transition-all uppercase tracking-wider">Join & Claim</button>
-          </div>`;
-      }
+      if (appState.user.sponsorAzx) spContainer.innerHTML = `<div class="glass-card rounded-xl p-3 flex justify-between items-center border border-slate-800 shadow-sm"><div class="flex items-center gap-2.5"><div class="w-10 h-10 rounded-lg border bg-blue-500/10 border-blue-500/20 flex items-center justify-center"><i class="fa-brands fa-telegram text-blue-400 text-lg"></i></div><div class="flex flex-col"><span class="text-[13px] font-black text-white tracking-wide">Join @azxcrypto</span><span class="text-emerald-400 text-[9px] font-bold tracking-widest uppercase mt-0.5">Completed</span></div></div><span class="text-[10px] font-black bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-lg border border-emerald-500/30 flex items-center gap-1"><i class="fa-solid fa-check-double"></i></span></div>`;
+      else spContainer.innerHTML = `<div class="glass-card rounded-xl p-3 flex justify-between items-center border border-blue-500/30 shadow-[0_0_15px_rgba(59,130,246,0.15)] relative overflow-hidden"><div class="absolute -right-4 -top-4 w-16 h-16 bg-blue-500/20 rounded-full blur-xl"></div><div class="flex items-center gap-2.5 relative z-10"><div class="w-10 h-10 rounded-lg border bg-blue-500/20 border-blue-500/40 flex items-center justify-center shadow-inner"><i class="fa-brands fa-telegram text-blue-400 text-lg drop-shadow-sm"></i></div><div class="flex flex-col"><span class="text-[13px] font-black text-white tracking-wide">Join @azxcrypto</span><span class="text-crypto-glow text-[9px] font-bold tracking-widest uppercase mt-0.5">+200 XP</span></div></div><button onclick="claimSponsorTask()" class="relative z-10 text-[10px] font-black bg-gradient-to-r from-blue-600 to-cyan-500 text-white px-3 py-1.5 rounded-lg shadow-[0_3px_10px_rgba(0,240,255,0.3)] active:scale-95 transition-all uppercase tracking-wider">Join & Claim</button></div>`;
 
-      // DAILY MISSIONS RENDER
-      const container = document.getElementById('missions-container');
-      container.innerHTML = '';
-      
+      const container = document.getElementById('missions-container'); container.innerHTML = '';
       const missionsList = [
         { id: 'watch5', label: 'Watch 5 Ads', icon: 'fa-video', color: 'text-blue-400', bg: 'bg-blue-500/10 border-blue-500/20', reward: 20, target: 5, current: appState.user.adsWatchedToday },
         { id: 'watch15', label: 'Watch 15 Ads', icon: 'fa-film', color: 'text-indigo-400', bg: 'bg-indigo-500/10 border-indigo-500/20', reward: 40, target: 15, current: appState.user.adsWatchedToday },
         { id: 'watch30', label: 'Watch 30 Ads', icon: 'fa-clapperboard', color: 'text-purple-400', bg: 'bg-purple-500/10 border-purple-500/20', reward: 80, target: 30, current: appState.user.adsWatchedToday },
-        { id: 'complete_all', label: 'Complete All Tasks', icon: 'fa-check-to-slot', color: 'text-emerald-400', bg: 'bg-emerald-500/10 border-emerald-500/20', reward: 100, target: 30, current: appState.user.adsWatchedToday } // Hedef 30 ad watch olaraq qeyd edilib ki, o bitəndə bu da tamamlansın
+        { id: 'complete_all', label: 'Complete All Tasks', icon: 'fa-check-to-slot', color: 'text-emerald-400', bg: 'bg-emerald-500/10 border-emerald-500/20', reward: 100, target: 30, current: appState.user.adsWatchedToday }
       ];
 
       missionsList.forEach(m => {
-        const claimed = appState.tasks.includes(m.id);
-        const canClaim = !claimed && m.current >= m.target;
-        
+        const claimed = appState.tasks.includes(m.id); const canClaim = !claimed && m.current >= m.target;
         let btnHtml = '';
-        if (claimed) {
-            btnHtml = `<span class="text-[9px] font-black bg-emerald-500/10 text-emerald-400 px-2.5 py-1.5 rounded-lg border border-emerald-500/30 flex items-center gap-1 shadow-inner"><i class="fa-solid fa-check-double"></i> Claimed</span>`;
-        } else if (canClaim) {
-            btnHtml = `<button onclick="claimTask('${m.id}', ${m.reward})" class="text-[10px] font-black bg-gradient-to-r from-blue-600 to-cyan-500 text-white px-3 py-1.5 rounded-lg shadow-[0_3px_10px_rgba(0,240,255,0.3)] active:scale-95 transition-all uppercase tracking-wider">Claim</button>`;
-        } else {
-            btnHtml = `<span class="text-[10px] font-black bg-slate-800/60 text-slate-300 px-3 py-1.5 rounded-lg border border-slate-700 shadow-inner">+${m.reward} XP</span>`;
-        }
-
-        container.innerHTML += `
-          <div class="glass-card rounded-xl p-3 flex justify-between items-center transition-transform hover:-translate-y-0.5 border border-slate-800/80 shadow-sm">
-            <div class="flex items-center gap-3">
-              <div class="w-10 h-10 rounded-lg border ${m.bg} flex items-center justify-center shadow-inner">
-                 <i class="fa-solid ${m.icon} ${m.color} text-lg drop-shadow-sm"></i>
-              </div>
-              <div class="flex flex-col">
-                <span class="text-[13px] font-black text-white tracking-wide">${m.label}</span>
-                <span class="text-crypto-glow text-[9px] font-bold tracking-widest uppercase opacity-80 mt-0.5">Progress: ${Math.min(m.current, m.target)}/${m.target}</span>
-              </div>
-            </div>
-            ${btnHtml}
-          </div>
-        `;
+        if (claimed) btnHtml = `<span class="text-[9px] font-black bg-emerald-500/10 text-emerald-400 px-2.5 py-1.5 rounded-lg border border-emerald-500/30 flex items-center gap-1 shadow-inner"><i class="fa-solid fa-check-double"></i> Claimed</span>`;
+        else if (canClaim) btnHtml = `<button onclick="claimTask('${m.id}', ${m.reward})" class="text-[10px] font-black bg-gradient-to-r from-blue-600 to-cyan-500 text-white px-3 py-1.5 rounded-lg shadow-[0_3px_10px_rgba(0,240,255,0.3)] active:scale-95 transition-all uppercase tracking-wider">Claim</button>`;
+        else btnHtml = `<span class="text-[10px] font-black bg-slate-800/60 text-slate-300 px-3 py-1.5 rounded-lg border border-slate-700 shadow-inner">+${m.reward} XP</span>`;
+        container.innerHTML += `<div class="glass-card rounded-xl p-3 flex justify-between items-center transition-transform hover:-translate-y-0.5 border border-slate-800/80 shadow-sm"><div class="flex items-center gap-3"><div class="w-10 h-10 rounded-lg border ${m.bg} flex items-center justify-center shadow-inner"><i class="fa-solid ${m.icon} ${m.color} text-lg drop-shadow-sm"></i></div><div class="flex flex-col"><span class="text-[13px] font-black text-white tracking-wide">${m.label}</span><span class="text-crypto-glow text-[9px] font-bold tracking-widest uppercase opacity-80 mt-0.5">Progress: ${Math.min(m.current, m.target)}/${m.target}</span></div></div>${btnHtml}</div>`;
       });
     }
 
     async function claimSponsorTask() {
         if(tg.HapticFeedback) tg.HapticFeedback.impactOccurred('medium');
         tg.openTelegramLink('https://t.me/azxcrypto');
-        
-        // Cüzi gecikmə ilə serverə claim sorğusu göndəririk
-        setTimeout(async () => {
-            const res = await apiCall('claim_task', { taskId: 'sponsor_azx', reward: 200 });
-            if(res && !res.error) showToast('Sponsor Task', `You earned +200 XP!`, 'success');
-        }, 1500);
+        setTimeout(async () => { const res = await apiCall('claim_task', { taskId: 'sponsor_azx', reward: 200 }); if(res && !res.error) showToast('Sponsor Task', `You earned +200 XP!`, 'success'); }, 1500);
     }
-
     async function claimTask(taskId, reward) {
         if(tg.HapticFeedback) tg.HapticFeedback.impactOccurred('medium');
         const res = await apiCall('claim_task', { taskId, reward });
@@ -1253,247 +1186,224 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     async function watchAd() {
-      const btn = document.getElementById('watch-ad-btn');
-      const originalHTML = btn.innerHTML;
+      const btn = document.getElementById('watch-ad-btn'); const originalHTML = btn.innerHTML;
       btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin text-base"></i> <span>Loading...</span>`;
       btn.classList.add('opacity-80', 'pointer-events-none');
-
       if (window.Adsgram) {
-        const AdController = window.Adsgram.init({ blockId: "int-35545" });
+        const AdController = window.Adsgram.init({ blockId: appState.settings.adBlockId || "int-35545" });
         AdController.show().then(async () => {
           const res = await apiCall('watch_ad');
           if(res && !res.error) showToast('Reward Granted!', 'You earned +20 XP.', 'success');
-          
-          btn.innerHTML = originalHTML;
-          btn.classList.remove('opacity-80', 'pointer-events-none');
-        }).catch((e) => {
-          btn.innerHTML = originalHTML;
-          btn.classList.remove('opacity-80', 'pointer-events-none');
-        });
-      } else {
-        showToast('Error', 'Ad system is currently unavailable.', 'error');
-        btn.innerHTML = originalHTML;
-        btn.classList.remove('opacity-80', 'pointer-events-none');
-      }
+          btn.innerHTML = originalHTML; btn.classList.remove('opacity-80', 'pointer-events-none');
+        }).catch(() => { btn.innerHTML = originalHTML; btn.classList.remove('opacity-80', 'pointer-events-none'); });
+      } else { showToast('Error', 'Ad system is currently unavailable.', 'error'); btn.innerHTML = originalHTML; btn.classList.remove('opacity-80', 'pointer-events-none'); }
     }
 
     async function openBox(type) {
       if(tg.HapticFeedback) tg.HapticFeedback.impactOccurred('heavy');
       const res = await apiCall('open_box', { boxType: type });
-      
       if(res && !res.error) {
-        if(res.jackpot) {
-            showToast('HUGE JACKPOT! 💸', `Incredible! You won $${res.reward.toFixed(2)} USDT!`, 'jackpot');
-        } else {
-            showToast('Box Opened!', `Congratulations! You won $${res.reward.toFixed(2)} USDT!`, 'success');
-        }
+        if(res.jackpot) showToast('HUGE JACKPOT! 💸', `Incredible! You won $${res.reward.toFixed(2)} USDT!`, 'jackpot');
+        else showToast('Box Opened!', `Congratulations! You won $${res.reward.toFixed(2)} USDT!`, 'success');
       }
     }
 
     async function requestWithdrawal() {
-      const address = document.getElementById('wallet-address').value;
-      const amount = parseFloat(document.getElementById('withdraw-amount').value);
-
-      if (!address || address.length < 10) {
-        showToast('Invalid Address', 'Please enter a valid TON wallet address.', 'error');
-        return;
-      }
-      if (isNaN(amount) || amount < 10) {
-        showToast('Invalid Amount', 'The minimum withdrawal amount is $10 USDT.', 'error');
-        return;
-      }
-      if (amount > appState.user.usd) {
-        showToast('Insufficient Balance', 'You do not have enough USDT available.', 'error');
-        return;
-      }
-
+      const address = document.getElementById('wallet-address').value; const amount = parseFloat(document.getElementById('withdraw-amount').value);
+      if (!address || address.length < 10) return showToast('Invalid Address', 'Please enter a valid TON wallet address.', 'error');
+      if (isNaN(amount) || amount < 10) return showToast('Invalid Amount', 'The minimum withdrawal amount is $10 USDT.', 'error');
+      if (amount > appState.user.usd) return showToast('Insufficient Balance', 'You do not have enough USDT available.', 'error');
       if(tg.HapticFeedback) tg.HapticFeedback.impactOccurred('medium');
       const res = await apiCall('withdraw', { amount, address });
-      if(res && !res.error) {
-          showToast('Withdrawal Requested', `Your request for $${amount.toFixed(2)} USDT has been submitted.`, 'success');
-          document.getElementById('wallet-address').value = '';
-          document.getElementById('withdraw-amount').value = '';
-      }
+      if(res && !res.error) { showToast('Withdrawal Requested', `Your request for $${amount.toFixed(2)} USDT has been submitted.`, 'success'); document.getElementById('wallet-address').value = ''; document.getElementById('withdraw-amount').value = ''; }
     }
 
     function renderWithdrawHistory() {
       const container = document.getElementById('withdraw-history-container');
-      const history = appState.withdrawals;
-      
-      if (history.length === 0) {
-        container.innerHTML = `
-          <div class="glass-card rounded-xl p-5 text-center border-dashed border-2 border-slate-700/50">
-            <i class="fa-solid fa-clock-rotate-left text-3xl text-slate-700 mb-2 drop-shadow-md"></i>
-            <p class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">History is Empty</p>
-          </div>`;
-        return;
-      }
-
-      container.innerHTML = history.map(r => `
-          <div class="glass-card rounded-xl p-3 flex justify-between items-center border border-slate-800/80">
-            <div class="flex items-center gap-2.5">
-              <div class="w-8 h-8 rounded-full bg-[#050511] border border-slate-700 flex items-center justify-center shadow-inner">
-                 <i class="fa-solid fa-arrow-right-arrow-left text-slate-400 text-xs"></i>
-              </div>
-              <div>
-                <p class="text-xs font-black text-white tracking-wide">${r.id} <span class="text-[9px] text-slate-500 ml-1 font-bold">${r.date}</span></p>
-                <p class="text-[9px] text-blue-400 mt-0.5 font-mono bg-blue-500/10 inline-block px-1.5 py-0.5 rounded border border-blue-500/20">${r.address}</p>
-              </div>
-            </div>
-            <div class="text-right">
-              <p class="text-[13px] font-black text-emerald-400">-$${formatNum(r.amount, true)}</p>
-              <p class="text-[8px] font-black text-amber-400 uppercase tracking-widest mt-1 bg-amber-500/10 inline-block px-2 py-0.5 rounded-full border border-amber-500/20">${r.status}</p>
-            </div>
-          </div>
-      `).join('');
+      if (appState.withdrawals.length === 0) return container.innerHTML = `<div class="glass-card rounded-xl p-5 text-center border-dashed border-2 border-slate-700/50"><i class="fa-solid fa-clock-rotate-left text-3xl text-slate-700 mb-2 drop-shadow-md"></i><p class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">History is Empty</p></div>`;
+      container.innerHTML = appState.withdrawals.map(r => `<div class="glass-card rounded-xl p-3 flex justify-between items-center border border-slate-800/80"><div class="flex items-center gap-2.5"><div class="w-8 h-8 rounded-full bg-[#050511] border border-slate-700 flex items-center justify-center shadow-inner"><i class="fa-solid fa-arrow-right-arrow-left text-slate-400 text-xs"></i></div><div><p class="text-xs font-black text-white tracking-wide">${r.id} <span class="text-[9px] text-slate-500 ml-1 font-bold">${r.date}</span></p><p class="text-[9px] text-blue-400 mt-0.5 font-mono bg-blue-500/10 inline-block px-1.5 py-0.5 rounded border border-blue-500/20">${r.address}</p></div></div><div class="text-right"><p class="text-[13px] font-black text-emerald-400">-$${formatNum(r.amount, true)}</p><p class="text-[8px] font-black text-amber-400 uppercase tracking-widest mt-1 bg-amber-500/10 inline-block px-2 py-0.5 rounded-full border border-amber-500/20">${r.status}</p></div></div>`).join('');
     }
 
-    function copyRefLink() {
-      const link = document.getElementById('ref-link-input').value;
-      navigator.clipboard.writeText(link).then(() => {
-        showToast("Success", "Referral link copied!", "success");
-      });
-    }
-
-    function shareReferralTelegram() {
-      const link = `https://t.me/pointplayappbot?startapp=${appState.user.tgId}`;
-      const text = `🚀 Complete premium tasks, open boxes, and earn USDT straight to your TON Wallet! 🤑 I'm already playing Point Play, join me now 🔥`;
-      const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(text)}`;
-      tg.openTelegramLink(shareUrl);
-    }
-
-    function toggleRefInfo() {
-      document.getElementById('ref-info-modal').classList.toggle('hidden');
-      document.getElementById('ref-info-modal').classList.toggle('flex');
-    }
+    function copyRefLink() { navigator.clipboard.writeText(document.getElementById('ref-link-input').value).then(() => showToast("Success", "Referral link copied!", "success")); }
+    function shareReferralTelegram() { tg.openTelegramLink(`https://t.me/share/url?url=${encodeURIComponent(`https://t.me/pointplayappbot?startapp=${appState.user.tgId}`)}&text=${encodeURIComponent(`🚀 Complete premium tasks, open boxes, and earn USDT straight to your TON Wallet! 🤑 I'm already playing Point Play, join me now 🔥`)}`); }
+    function toggleRefInfo() { document.getElementById('ref-info-modal').classList.toggle('hidden'); document.getElementById('ref-info-modal').classList.toggle('flex'); }
 
     function renderReferrals() {
       const container = document.getElementById('referral-list-container');
-      const list = appState.referrals;
-      
-      if (list.length === 0) {
-        container.innerHTML = `
-          <div class="glass-card rounded-xl p-5 text-center border-dashed border-2 border-slate-700/50">
-            <i class="fa-solid fa-user-plus text-3xl text-slate-700 mb-2 drop-shadow-md"></i>
-            <p class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">No referrals yet</p>
-          </div>`;
-        return;
-      }
-
-      container.innerHTML = list.map(r => {
-        const isAppr = r.status === 'Approved';
-        const statusClass = isAppr ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30 shadow-[0_0_8px_rgba(16,185,129,0.1)]' : 'bg-amber-500/10 text-amber-400 border-amber-500/30';
-        const displayUsername = r.username ? `@${r.username}` : '';
-        const initial = r.name ? r.name.charAt(0).toUpperCase() : 'U';
-
-        return `
-          <div class="glass-card rounded-xl p-3.5 flex flex-col gap-3 border border-slate-800/80">
-            <div class="flex justify-between items-center">
-              <div class="flex items-center gap-2.5">
-                <div class="w-9 h-9 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center font-black text-white shadow-[0_0_10px_rgba(59,130,246,0.3)] text-sm">${initial}</div>
-                <div class="flex flex-col">
-                  <span class="text-xs font-black text-white tracking-wide truncate max-w-[120px]">${r.name}</span>
-                  ${displayUsername ? `<span class="text-[9px] text-slate-400 font-mono mt-0.5">${displayUsername}</span>` : ''}
-                </div>
-              </div>
-              <span class="text-[8px] font-black uppercase tracking-widest px-2 py-1 rounded border ${statusClass}">${r.status}</span>
-            </div>
-            
-            ${!isAppr ? `
-            <div class="bg-[#050511]/60 rounded-lg p-2.5 border border-slate-700/60 grid grid-cols-2 gap-2.5 shadow-inner">
-              <div class="text-center">
-                <p class="text-[8px] font-bold text-slate-500 uppercase tracking-widest mb-1">Ads Progress</p>
-                <div class="w-full bg-slate-800 rounded-full h-1 mb-1 overflow-hidden shadow-inner">
-                  <div class="bg-blue-500 h-full rounded-full" style="width: ${Math.min((r.ads/25)*100, 100)}%"></div>
-                </div>
-                <p class="text-[10px] font-black text-white">${r.ads} <span class="text-slate-500 font-bold">/ 25</span></p>
-              </div>
-              <div class="text-center border-l border-slate-700">
-                <p class="text-[8px] font-bold text-slate-500 uppercase tracking-widest mb-1">Task Progress</p>
-                <div class="w-3/4 mx-auto bg-slate-800 rounded-full h-1 mb-1 overflow-hidden shadow-inner">
-                  <div class="bg-crypto-glow h-full rounded-full" style="width: ${Math.min((r.tasks/5)*100, 100)}%"></div>
-                </div>
-                <p class="text-[10px] font-black text-white">${r.tasks} <span class="text-slate-500 font-bold">/ 5</span></p>
-              </div>
-            </div>` : ''}
-          </div>
-        `;
+      if (appState.referrals.length === 0) return container.innerHTML = `<div class="glass-card rounded-xl p-5 text-center border-dashed border-2 border-slate-700/50"><i class="fa-solid fa-user-plus text-3xl text-slate-700 mb-2 drop-shadow-md"></i><p class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">No referrals yet</p></div>`;
+      container.innerHTML = appState.referrals.map(r => {
+        const isAppr = r.status === 'Approved'; const statusClass = isAppr ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' : 'bg-amber-500/10 text-amber-400 border-amber-500/30';
+        return `<div class="glass-card rounded-xl p-3.5 flex flex-col gap-3 border border-slate-800/80"><div class="flex justify-between items-center"><div class="flex items-center gap-2.5"><div class="w-9 h-9 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center font-black text-white text-sm">${r.name.charAt(0).toUpperCase()}</div><div class="flex flex-col"><span class="text-xs font-black text-white tracking-wide truncate max-w-[120px]">${r.name}</span>${r.username ? `<span class="text-[9px] text-slate-400 font-mono mt-0.5">@${r.username}</span>` : ''}</div></div><span class="text-[8px] font-black uppercase tracking-widest px-2 py-1 rounded border ${statusClass}">${r.status}</span></div>${!isAppr ? `<div class="bg-[#050511]/60 rounded-lg p-2.5 border border-slate-700/60 grid grid-cols-2 gap-2.5 shadow-inner"><div class="text-center"><p class="text-[8px] font-bold text-slate-500 uppercase tracking-widest mb-1">Ads</p><div class="w-full bg-slate-800 rounded-full h-1 mb-1 overflow-hidden shadow-inner"><div class="bg-blue-500 h-full rounded-full" style="width: ${Math.min((r.ads/25)*100, 100)}%"></div></div><p class="text-[10px] font-black text-white">${r.ads} <span class="text-slate-500 font-bold">/ 25</span></p></div><div class="text-center border-l border-slate-700"><p class="text-[8px] font-bold text-slate-500 uppercase tracking-widest mb-1">Task</p><div class="w-3/4 mx-auto bg-slate-800 rounded-full h-1 mb-1 overflow-hidden shadow-inner"><div class="bg-crypto-glow h-full rounded-full" style="width: ${Math.min((r.tasks/5)*100, 100)}%"></div></div><p class="text-[10px] font-black text-white">${r.tasks} <span class="text-slate-500 font-bold">/ 5</span></p></div></div>` : ''}</div>`;
       }).join('');
     }
 
     function renderRewardHistory() {
       const container = document.getElementById('referral-rewards-container');
-      const rewards = appState.rewards;
-      
-      if (rewards.length === 0) {
-        container.innerHTML = `
-          <div class="glass-card rounded-xl p-4 text-center border-dashed border border-slate-700/50">
-            <p class="text-[9px] font-bold text-slate-500 uppercase tracking-widest">No rewards yet</p>
-          </div>`;
-        return;
-      }
-
-      container.innerHTML = rewards.map(r => `
-        <div class="glass-card rounded-lg p-3 flex justify-between items-center border border-slate-800/80 shadow-sm">
-          <div class="flex items-center gap-2.5">
-            <div class="w-8 h-8 rounded-full bg-emerald-500/20 border border-emerald-500/50 flex items-center justify-center text-emerald-400 shadow-inner">
-               <i class="fa-solid fa-gift text-sm drop-shadow-sm"></i>
-            </div>
-            <div>
-              <p class="text-[11px] font-black text-white tracking-wide">${r.title}</p>
-              <p class="text-[9px] text-slate-400 mt-0.5 truncate max-w-[130px]">${r.desc}</p>
-            </div>
-          </div>
-          <div class="text-right flex flex-col items-end">
-            <span class="text-[10px] font-black text-crypto-glow">+${r.xp} XP</span>
-            <span class="text-[10px] font-black text-emerald-400 mt-0.5">+$${formatNum(r.usd, true)}</span>
-          </div>
-        </div>
-      `).join('');
+      if (appState.rewards.length === 0) return container.innerHTML = `<div class="glass-card rounded-xl p-4 text-center border-dashed border border-slate-700/50"><p class="text-[9px] font-bold text-slate-500 uppercase tracking-widest">No rewards yet</p></div>`;
+      container.innerHTML = appState.rewards.map(r => `<div class="glass-card rounded-lg p-3 flex justify-between items-center border border-slate-800/80 shadow-sm"><div class="flex items-center gap-2.5"><div class="w-8 h-8 rounded-full bg-emerald-500/20 border border-emerald-500/50 flex items-center justify-center text-emerald-400 shadow-inner"><i class="fa-solid fa-gift text-sm drop-shadow-sm"></i></div><div><p class="text-[11px] font-black text-white tracking-wide">${r.title}</p><p class="text-[9px] text-slate-400 mt-0.5 truncate max-w-[130px]">${r.desc}</p></div></div><div class="text-right flex flex-col items-end"><span class="text-[10px] font-black text-crypto-glow">+${r.xp} XP</span><span class="text-[10px] font-black text-emerald-400 mt-0.5">+$${formatNum(r.usd, true)}</span></div></div>`).join('');
     }
 
-    // UI Navigation 
     function switchTab(tabId) {
-      document.querySelectorAll('.view-section').forEach(el => {
-          el.classList.add('hidden');
-          el.classList.remove('animate-slide-up');
-      });
+      document.querySelectorAll('.view-section').forEach(el => { el.classList.add('hidden'); el.classList.remove('animate-slide-up'); });
       document.querySelectorAll('.nav-btn').forEach(btn => btn.classList.remove('nav-active'));
-
       const targetView = document.getElementById(`view-${tabId}`);
-      targetView.classList.remove('hidden');
-      targetView.classList.add('animate-slide-up');
+      targetView.classList.remove('hidden'); targetView.classList.add('animate-slide-up');
       
-      document.querySelector(`[data-target="${tabId}"]`).classList.add('nav-active');
-      
+      const tabTarget = document.querySelector(`[data-target="${tabId}"]`);
+      if (tabTarget) tabTarget.classList.add('nav-active');
       if (tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
 
-    function updateTimer() {
-        const now = new Date();
-        const tomorrow = new Date(now);
-        tomorrow.setUTCHours(24, 0, 0, 0); 
-        
-        const diff = tomorrow.getTime() - now.getTime();
-        const h = Math.floor(diff / 1000 / 60 / 60);
-        const m = Math.floor((diff / 1000 / 60) % 60);
-        const s = Math.floor((diff / 1000) % 60);
-        
-        document.getElementById('reset-timer').innerText = 
-          `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    // SERVER-SYNCED TIMER
+    let serverTimeSec = 0;
+    let nextResetSec = 0;
+    let timeRemaining = 0;
+    
+    function startServerTimer(currentServer, resetServer) {
+        timeRemaining = resetServer - currentServer;
+        setInterval(() => {
+            if (timeRemaining > 0) timeRemaining--;
+            if (timeRemaining <= 0) { document.getElementById('reset-timer').innerText = "00:00:00"; return; }
+            
+            const h = Math.floor(timeRemaining / 3600);
+            const m = Math.floor((timeRemaining % 3600) / 60);
+            const s = Math.floor(timeRemaining % 60);
+            document.getElementById('reset-timer').innerText = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+        }, 1000);
     }
     
     async function initApp() {
       const res = await apiCall('init');
-      
-      setTimeout(() => {
-        document.getElementById('loading-overlay').style.opacity = '0';
-        setTimeout(() => { document.getElementById('loading-overlay').style.display = 'none'; }, 500); 
-      }, 600);
-      
-      setInterval(updateTimer, 1000);
-      updateTimer();
+      if(res && res.serverTime) startServerTimer(res.serverTime, res.serverResetTime);
+      setTimeout(() => { document.getElementById('loading-overlay').style.opacity = '0'; setTimeout(() => { document.getElementById('loading-overlay').style.display = 'none'; }, 500); }, 600);
+    }
+
+    // --- ADMIN PANEL FUNCTIONS ---
+    function openAdminAuth() {
+        document.getElementById('admin-auth-modal').classList.remove('hidden');
+        document.getElementById('admin-auth-modal').classList.add('flex');
+    }
+    function closeAdminAuth() {
+        document.getElementById('admin-auth-modal').classList.add('hidden');
+        document.getElementById('admin-auth-modal').classList.remove('flex');
+    }
+    async function submitAdminAuth() {
+        const code = document.getElementById('admin-code-input').value;
+        adminToken = code;
+        const res = await apiCall('admin_dashboard', { adminCode: code });
+        if(res && !res.error) {
+            closeAdminAuth();
+            switchTab('admin');
+            
+            document.getElementById('adm-stat-users').innerText = res.stats.users;
+            document.getElementById('adm-stat-usd').innerText = `$${res.stats.usd.toFixed(2)}`;
+            document.getElementById('adm-stat-ads').innerText = res.stats.ads;
+            document.getElementById('adm-stat-tasks').innerText = res.stats.tasks;
+            document.getElementById('adm-stat-xp').innerText = res.stats.xp;
+            document.getElementById('adm-stat-refs').innerText = res.stats.refs;
+            
+            document.getElementById('admin-ad-sdk').value = appState.settings.adBlockId;
+            adminUsers = res.all_users;
+            adminWithdrawals = res.all_withdrawals;
+            renderAdminUsers();
+            renderAdminWithdrawals();
+        }
+    }
+
+    function switchAdminTab(tab) {
+        document.querySelectorAll('.admin-section').forEach(el => el.classList.add('hidden'));
+        document.getElementById(`admin-sec-${tab}`).classList.remove('hidden');
+        document.querySelectorAll('.admin-tab').forEach(el => { el.classList.remove('bg-red-600/20', 'text-red-400', 'border', 'border-red-500/50'); el.classList.add('text-slate-400'); });
+        document.getElementById(`tab-${tab}`).classList.add('bg-red-600/20', 'text-red-400', 'border', 'border-red-500/50');
+        document.getElementById(`tab-${tab}`).classList.remove('text-slate-400');
+    }
+
+    function renderAdminUsers() {
+        const query = document.getElementById('admin-user-search').value.toLowerCase();
+        const list = adminUsers.filter(u => u.tgId.includes(query) || (u.username && u.username.toLowerCase().includes(query)));
+        
+        document.getElementById('admin-user-list').innerHTML = list.map(u => `
+            <div class="glass-card p-3 rounded-lg border border-slate-700 space-y-2">
+                <div class="flex justify-between items-center">
+                    <div>
+                        <p class="text-xs font-black text-white">${u.firstName} <span class="text-slate-400 font-mono text-[9px]">@${u.username}</span></p>
+                        <p class="text-[9px] text-blue-400">ID: ${u.tgId} | Active: ${u.lastActive.substr(0,16)}</p>
+                    </div>
+                    ${u.banned ? '<span class="text-[8px] bg-red-500/20 text-red-500 px-2 py-1 rounded">BANNED</span>' : '<span class="text-[8px] bg-emerald-500/20 text-emerald-500 px-2 py-1 rounded">ACTIVE</span>'}
+                </div>
+                <div class="flex gap-2 items-center bg-[#050511] p-2 rounded">
+                    <input type="number" id="adm-usd-${u.tgId}" value="${u.usd.toFixed(2)}" class="w-16 bg-transparent text-xs text-emerald-400 outline-none border-b border-slate-600 text-center" title="USD">
+                    <input type="number" id="adm-xp-${u.tgId}" value="${u.xp}" class="w-16 bg-transparent text-xs text-crypto-glow outline-none border-b border-slate-600 text-center" title="XP">
+                    <button onclick="adminSaveUser('${u.tgId}')" class="bg-blue-600/20 text-blue-400 px-2 py-1 rounded text-[10px]">Save</button>
+                </div>
+                <div class="flex gap-2">
+                    <button onclick="adminActionUser('${u.tgId}', 'reset_ads')" class="flex-1 bg-amber-500/20 text-amber-500 py-1 rounded text-[9px] uppercase font-black">Reset Ads (${u.adsWatchedToday})</button>
+                    <button onclick="adminActionUser('${u.tgId}', '${u.banned ? 'unban' : 'ban'}')" class="flex-1 ${u.banned ? 'bg-emerald-500/20 text-emerald-500' : 'bg-red-500/20 text-red-500'} py-1 rounded text-[9px] uppercase font-black">${u.banned ? 'Unban' : 'Ban'}</button>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    function filterAdminUsers() { renderAdminUsers(); }
+
+    async function adminSaveUser(tgId) {
+        const newUsd = document.getElementById(`adm-usd-${tgId}`).value;
+        const newXp = document.getElementById(`adm-xp-${tgId}`).value;
+        await adminActionUser(tgId, 'update_balance', { newUsd, newXp });
+    }
+
+    async function adminActionUser(targetUid, userAction, extras = {}) {
+        const res = await apiCall('admin_action_user', { adminCode: adminToken, targetUid, userAction, ...extras });
+        if(res && !res.error) {
+            showToast('Success', res.message, 'success');
+            submitAdminAuth(); // Refresh data
+        }
+    }
+
+    function renderAdminWithdrawals() {
+        const pending = adminWithdrawals.filter(w => w.status === 'Pending');
+        if(pending.length === 0) {
+            document.getElementById('admin-withdrawal-list').innerHTML = '<p class="text-center text-xs text-slate-500 py-4">No pending requests</p>';
+            return;
+        }
+        document.getElementById('admin-withdrawal-list').innerHTML = pending.map(w => `
+            <div class="glass-card p-3 rounded-lg border border-slate-700">
+                <div class="flex justify-between items-center mb-2">
+                    <div>
+                        <p class="text-xs font-black text-white">ID: ${w.user_id}</p>
+                        <p class="text-[9px] text-slate-400">${w.date}</p>
+                    </div>
+                    <p class="text-sm font-black text-emerald-400">$${w.amount.toFixed(2)}</p>
+                </div>
+                <div class="bg-[#050511] p-1.5 rounded mb-2 overflow-hidden text-ellipsis">
+                    <p class="text-[10px] text-blue-400 font-mono">${w.address}</p>
+                </div>
+                <div class="flex gap-2">
+                    <button onclick="adminWithdrawAction('${w.user_id}', ${w.idx}, 'approve')" class="flex-1 bg-emerald-500/20 text-emerald-500 py-1.5 rounded text-[10px] uppercase font-black">Approve</button>
+                    <button onclick="adminWithdrawAction('${w.user_id}', ${w.idx}, 'reject')" class="flex-1 bg-red-500/20 text-red-500 py-1.5 rounded text-[10px] uppercase font-black">Reject</button>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    async function adminWithdrawAction(targetUid, idx, action) {
+        if(confirm(`Are you sure you want to ${action} this withdrawal?`)) {
+            const res = await apiCall('admin_action_withdraw', { adminCode: adminToken, targetUid, idx, withdrawAction: action });
+            if(res && !res.error) {
+                showToast('Success', res.message, 'success');
+                submitAdminAuth(); // Refresh
+            }
+        }
+    }
+
+    async function saveAdminSettings() {
+        const blockId = document.getElementById('admin-ad-sdk').value;
+        const res = await apiCall('admin_update_settings', { adminCode: adminToken, blockId });
+        if(res && !res.error) {
+            showToast('Success', res.message, 'success');
+            appState.settings.adBlockId = blockId;
+        }
     }
 
     // Start App

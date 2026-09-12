@@ -80,8 +80,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'boxesOpened' => 0,
             'streak' => 1,
             'lastResetDay' => $today,
-            'referrer' => null,
-            'azxCryptoTaskCompleted' => false
+            'referrer' => null
         ];
 
         // Process referral joining
@@ -94,8 +93,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // Add to referrer's list
                 $referrals[$refId][] = [
                     'uid' => $uid,
-                    'name' => trim(($input['firstName'] ?? '') . ' ' . ($input['lastName'] ?? '')),
-                    'username' => $input['username'] ?? '',
+                    'name' => trim(($users[$uid]['firstName'] ?? '') . ' ' . ($users[$uid]['lastName'] ?? '')),
+                    'username' => $users[$uid]['username'],
                     'status' => 'Pending',
                     'ads' => 0,
                     'tasks' => 0,
@@ -105,7 +104,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
         }
     } else {
-        // Update user profile dynamically if changed
+        // Update user data seamlessly on every init if names change
         if (isset($input['firstName'])) $users[$uid]['firstName'] = $input['firstName'];
         if (isset($input['lastName'])) $users[$uid]['lastName'] = $input['lastName'];
         if (isset($input['username'])) $users[$uid]['username'] = $input['username'];
@@ -170,9 +169,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     
                     // Log Reward
                     if (!isset($rewards[$referrerId])) $rewards[$referrerId] = [];
+                    $refName = trim(($refUser['firstName'] ?? '') . ' ' . ($refUser['lastName'] ?? ''));
                     array_unshift($rewards[$referrerId], [
                         'title' => 'Referral Bonus',
-                        'desc' => "Referral: " . trim($refUser['firstName'] . ' ' . $refUser['lastName']),
+                        'desc' => "Referral: " . $refName,
                         'xp' => 250,
                         'usd' => 0.025,
                         'date' => date('M j, Y')
@@ -210,7 +210,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             
             if (!in_array($taskId, $tasks[$uid])) {
                 $rewardXp = (int)($input['reward'] ?? 0);
-                if ($rewardXp > 0 && $rewardXp <= 100) { // basic security cap for daily missions
+                if ($rewardXp > 0 && $rewardXp <= 500) { // cap updated for safety
                     $tasks[$uid][] = $taskId;
                     $users[$uid]['tasksCompleted'] += 1;
                     $users[$uid]['xp'] += $rewardXp;
@@ -219,18 +219,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     evaluateReferralProgress($uid, $users, $referrals, $rewards);
                     writeDB('tasks.json', $tasks);
                 }
-            }
-            break;
-
-        case 'claim_azx':
-            if (empty($users[$uid]['azxCryptoTaskCompleted'])) {
-                $users[$uid]['azxCryptoTaskCompleted'] = true;
-                $users[$uid]['xp'] += 200;
-                $users[$uid]['totalXp'] += 200;
-                $users[$uid]['level'] = calcLevel($users[$uid]['totalXp']);
-                evaluateReferralProgress($uid, $users, $referrals, $rewards);
             } else {
-                $response['error'] = 'Task already claimed';
+                $response['error'] = 'Task already claimed today.';
             }
             break;
 
@@ -261,6 +251,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $amount = (float)($input['amount'] ?? 0);
             $address = $input['address'] ?? '';
             
+            // Minimum withdrawal validation -> EXACTLY 10 USD minimum
             if ($amount >= 10 && $amount <= $users[$uid]['usd'] && strlen($address) > 5) {
                 $users[$uid]['usd'] -= $amount;
                 
@@ -268,28 +259,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 array_unshift($withdrawals[$uid], [
                     'id' => '#' . strtoupper(substr(md5(uniqid()), 0, 6)),
                     'amount' => $amount,
-                    'address' => $address, // Store full address, front-end will truncate if needed
+                    'address' => substr($address, 0, 6) . '...' . substr($address, -4),
                     'date' => date('M j, Y'),
-                    'status' => 'Pending',
-                    'currency' => 'USDT',
-                    'network' => 'TON'
+                    'status' => 'Pending'
                 ]);
                 writeDB('withdrawals.json', $withdrawals);
             } else {
-                $response['error'] = 'Invalid withdrawal request';
+                $response['error'] = 'Invalid withdrawal request. Minimum is $10 and valid address required.';
             }
-            break;
-            
-        case 'game_level_clear':
-            $rewardXp = 50; 
-            $users[$uid]['xp'] += $rewardXp;
-            $users[$uid]['totalXp'] += $rewardXp;
-            $users[$uid]['level'] = calcLevel($users[$uid]['totalXp']);
             break;
     }
 
+    // Save user state
     writeDB('users.json', $users);
     
+    // Compile full updated state for client
     $response['user'] = $users[$uid];
     $response['referrals'] = $referrals[$uid] ?? [];
     $response['rewards'] = $rewards[$uid] ?? [];
@@ -299,19 +283,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     echo json_encode($response);
     exit;
 }
+
+// -----------------------------------------------------------------------------------------
+// FRONTEND - HTML / JS / CSS (Served directly from index.php)
+// -----------------------------------------------------------------------------------------
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>Point Play - Premium Telegram Mini App</title>
+  <title>Point Play - Telegram Mini App</title>
   
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <script src="https://sad.adsgram.ai/js/sad.min.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800;900&display=swap" rel="stylesheet">
 
   <script>
     tailwind.config = {
@@ -320,44 +308,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           fontFamily: { sans: ['Outfit', 'sans-serif'] },
           colors: {
             crypto: {
-              bg: '#030308',
-              card: '#0a0a16',
-              primary: '#3b82f6',
-              glow: '#00e5ff',
-              accent: '#7c3aed',
-              gold: '#ffd700',
-              silver: '#e2e8f0',
-              bronze: '#d48855',
-              success: '#10b981',
-              danger: '#ef4444'
+              dark: '#050511',     
+              card: '#0a0b1a',     
+              primary: '#3b82f6',  
+              glow: '#00f0ff',     
+              gold: '#ffb800',     
+              silver: '#e2e8f0',   
+              bronze: '#cd7f32'    
             }
           },
           animation: {
-            'blob': 'blob 10s infinite',
-            'float': 'float 6s ease-in-out infinite',
+            'blob': 'blob 7s infinite',
             'pulse-fast': 'pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite',
-            'pop': 'pop 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards',
-            'shimmer': 'shimmer 2.5s infinite',
-            'slide-up': 'slideUp 0.5s ease-out forwards'
+            'float-up': 'floatUp 2s ease-out forwards',
+            'pop': 'pop 0.3s ease-out forwards',
+            'shimmer': 'shimmer 2s infinite',
+            'slide-up': 'slideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards'
           },
           keyframes: {
             blob: {
               '0%': { transform: 'translate(0px, 0px) scale(1)' },
-              '33%': { transform: 'translate(40px, -60px) scale(1.2)' },
-              '66%': { transform: 'translate(-30px, 30px) scale(0.8)' },
+              '33%': { transform: 'translate(30px, -50px) scale(1.1)' },
+              '66%': { transform: 'translate(-20px, 20px) scale(0.9)' },
               '100%': { transform: 'translate(0px, 0px) scale(1)' },
             },
-            float: {
-              '0%, 100%': { transform: 'translateY(0)' },
-              '50%': { transform: 'translateY(-10px)' },
+            floatUp: {
+              '0%': { transform: 'translateY(0) scale(1)', opacity: 1 },
+              '100%': { transform: 'translateY(-100px) scale(0.5)', opacity: 0 }
             },
             pop: {
-              '0%': { transform: 'scale(0.8)', opacity: 0 },
-              '100%': { transform: 'scale(1)', opacity: 1 }
+              '0%': { transform: 'scale(1)' },
+              '50%': { transform: 'scale(1.3)' },
+              '100%': { transform: 'scale(0)', opacity: 0 }
             },
             shimmer: {
-              '0%': { transform: 'translateX(-150%) skewX(-15deg)' },
-              '100%': { transform: 'translateX(150%) skewX(-15deg)' }
+              '0%': { transform: 'translateX(-100%)' },
+              '100%': { transform: 'translateX(100%)' }
             },
             slideUp: {
               '0%': { transform: 'translateY(20px)', opacity: 0 },
@@ -370,574 +356,551 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   </script>
 
   <style>
-    :root {
-      --safe-area-top: env(safe-area-inset-top, 0px);
-      --safe-area-bottom: env(safe-area-inset-bottom, 0px);
-    }
     body {
-      background-color: #030308;
+      background-color: #050511;
       color: #f8fafc;
       overflow-x: hidden;
       -webkit-touch-callout: none;
       -webkit-user-select: none;
       user-select: none;
-      -webkit-tap-highlight-color: transparent;
     }
+
     .bg-orb-1 {
-      position: fixed; top: -15%; left: -15%; width: 70vw; height: 70vw;
-      background: radial-gradient(circle, rgba(124, 58, 237, 0.15) 0%, rgba(0, 0, 0, 0) 60%);
-      z-index: -1; filter: blur(50px);
+      position: fixed; top: -10%; left: -10%; width: 50vw; height: 50vw;
+      background: radial-gradient(circle, rgba(59, 130, 246, 0.15) 0%, rgba(0, 0, 0, 0) 70%);
+      z-index: -1; filter: blur(40px);
     }
     .bg-orb-2 {
-      position: fixed; bottom: -10%; right: -20%; width: 80vw; height: 80vw;
-      background: radial-gradient(circle, rgba(0, 229, 255, 0.12) 0%, rgba(0, 0, 0, 0) 65%);
-      z-index: -1; filter: blur(60px);
+      position: fixed; bottom: -10%; right: -10%; width: 60vw; height: 60vw;
+      background: radial-gradient(circle, rgba(0, 240, 255, 0.1) 0%, rgba(0, 0, 0, 0) 70%);
+      z-index: -1; filter: blur(50px);
     }
 
     input { user-select: auto !important; }
     img { pointer-events: none; }
     ::-webkit-scrollbar { width: 0px; background: transparent; }
 
-    .premium-glass {
-      background: linear-gradient(145deg, rgba(20, 21, 35, 0.7) 0%, rgba(10, 11, 20, 0.9) 100%);
+    .glass-card {
+      background: linear-gradient(145deg, rgba(20, 22, 45, 0.7) 0%, rgba(10, 11, 26, 0.85) 100%);
       backdrop-filter: blur(20px);
       -webkit-backdrop-filter: blur(20px);
-      border: 1px solid rgba(255, 255, 255, 0.06);
-      box-shadow: 0 10px 40px -10px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
     }
     
-    .premium-btn {
-      background: linear-gradient(135deg, rgba(59,130,246,0.15) 0%, rgba(0,229,255,0.05) 100%);
-      border: 1px solid rgba(0,229,255,0.25);
-      box-shadow: 0 0 20px rgba(0,229,255,0.05) inset;
-      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-    }
-    .premium-btn:active {
-      transform: scale(0.96);
-      border-color: rgba(0,229,255,0.6);
-      background: rgba(0,229,255,0.1);
+    .glass-button {
+      background: linear-gradient(135deg, rgba(59,130,246,0.2) 0%, rgba(0,240,255,0.1) 100%);
+      border: 1px solid rgba(0,240,255,0.3);
+      box-shadow: 0 0 15px rgba(0,240,255,0.1) inset;
     }
 
-    .fade-in { animation: slideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+    .fade-in { animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(15px); } to { opacity: 1; transform: translateY(0); } }
 
     /* Navigation styling */
-    .nav-active {
-      color: #00e5ff !important;
-    }
-    .nav-active i {
-      transform: translateY(-4px);
-      filter: drop-shadow(0 4px 6px rgba(0, 229, 255, 0.4));
-    }
-    .nav-active span {
-      opacity: 1 !important;
-      transform: translateY(-2px);
-    }
-    .nav-active::after {
-      content: ''; position: absolute; bottom: -8px; left: 50%; transform: translateX(-50%);
-      width: 4px; height: 4px; background: #00e5ff; border-radius: 50%;
-      box-shadow: 0 0 10px #00e5ff;
+    .nav-active { color: #00f0ff !important; transform: translateY(-4px); }
+    .nav-active i { filter: drop-shadow(0 0 10px rgba(0, 240, 255, 0.8)); }
+    .nav-active::before {
+      content: ''; position: absolute; top: -12px; left: 50%; transform: translateX(-50%);
+      width: 24px; height: 4px; background: #00f0ff; border-radius: 4px;
+      box-shadow: 0 0 15px #00f0ff, 0 0 25px #3b82f6;
     }
 
-    .action-btn {
+    .btn-3d {
       background: linear-gradient(to bottom, #3b82f6, #2563eb);
-      position: relative;
-      overflow: hidden;
-      transition: transform 0.1s;
+      border-bottom: 3px solid #1e3a8a;
+      transition: all 0.1s;
     }
-    .action-btn:active { transform: scale(0.97); }
-    .action-btn::after {
-      content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0;
-      background: linear-gradient(rgba(255,255,255,0.2), transparent);
-      opacity: 0.5; border-radius: inherit; pointer-events: none;
+    .btn-3d:active {
+      transform: translateY(3px);
+      border-bottom-width: 0px;
+      margin-bottom: 3px;
     }
 
     #toast-container {
       position: fixed; top: 1.5rem; left: 50%; transform: translate(-50%, -150%) scale(0.9);
-      width: calc(100% - 2rem); max-width: 400px; z-index: 999999;
-      transition: all 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+      width: 90%; max-width: 380px; z-index: 999999;
+      transition: all 0.5s cubic-bezier(0.68, -0.55, 0.265, 1.55);
       opacity: 0; pointer-events: none;
     }
-    .toast-show { transform: translate(-50%, var(--safe-area-top)) scale(1) !important; opacity: 1 !important; }
+    .toast-show { transform: translate(-50%, 0) scale(1) !important; opacity: 1 !important; }
 
-    .box-bronze { background: linear-gradient(145deg, rgba(35,21,12,0.8), rgba(20,10,5,0.9)); border: 1px solid rgba(212,136,85,0.3); }
-    .box-silver { background: linear-gradient(145deg, rgba(30,41,59,0.8), rgba(15,23,42,0.9)); border: 1px solid rgba(226,232,240,0.3); }
-    .box-gold { background: linear-gradient(145deg, rgba(69,45,0,0.8), rgba(30,20,0,0.9)); border: 1px solid rgba(255,215,0,0.4); }
+    .box-bronze { background: linear-gradient(135deg, rgba(205,127,50,0.15), rgba(139,69,19,0.25)); border: 1px solid rgba(205,127,50,0.4); }
+    .box-silver { background: linear-gradient(135deg, rgba(226,232,240,0.15), rgba(148,163,184,0.25)); border: 1px solid rgba(226,232,240,0.4); }
+    .box-gold { background: linear-gradient(135deg, rgba(255,184,0,0.2), rgba(217,119,6,0.3)); border: 1px solid rgba(255,184,0,0.5); }
 
     .modal-overlay {
-      background: rgba(3, 3, 8, 0.9);
-      backdrop-filter: blur(12px);
+      background: rgba(5, 5, 17, 0.85);
+      backdrop-filter: blur(10px);
       z-index: 10000;
     }
     
-    .text-truncate {
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
+    /* Ensure bottom nav accounts for iOS safe area */
+    .pb-safe { padding-bottom: env(safe-area-inset-bottom); }
   </style>
 </head>
-<body class="flex flex-col min-h-screen pb-28">
+<body class="flex flex-col min-h-screen">
   
   <div class="bg-orb-1 animate-blob"></div>
-  <div class="bg-orb-2 animate-blob" style="animation-delay: 2s;"></div>
+  <div class="bg-orb-2 animate-blob" style="animation-delay: 2s"></div>
 
   <!-- Start Screen -->
-  <div id="loading-overlay" class="bg-[#030308] flex flex-col items-center justify-center z-[100000] fixed inset-0 transition-opacity duration-700">
-    <div class="relative w-28 h-28 mb-8 flex items-center justify-center">
-      <div class="absolute inset-0 rounded-full border-t-2 border-crypto-glow animate-[spin_1.5s_linear_infinite] shadow-[0_0_30px_rgba(0,229,255,0.3)]"></div>
-      <div class="absolute inset-2 rounded-full border-b-2 border-purple-500 animate-[spin_2s_linear_infinite_reverse]"></div>
-      <div class="absolute inset-4 rounded-full border-r-2 border-blue-500 animate-[spin_1s_linear_infinite]"></div>
-      <div class="relative z-10 w-16 h-16 bg-[#0a0a16] rounded-full flex items-center justify-center premium-glass shadow-[0_0_20px_#00e5ff]">
-        <i class="fa-solid fa-gamepad text-crypto-glow text-3xl animate-pulse"></i>
+  <div id="loading-overlay" class="bg-[#050511] flex flex-col items-center justify-center z-[100000] fixed inset-0 transition-opacity duration-500">
+    <div class="relative w-28 h-28 mb-8">
+      <div class="absolute inset-0 rounded-full border-t-4 border-crypto-glow animate-[spin_1s_linear_infinite] shadow-[0_0_25px_rgba(0,240,255,0.6)]"></div>
+      <div class="absolute inset-3 rounded-full border-b-4 border-blue-500 animate-[spin_1.5s_linear_infinite_reverse]"></div>
+      <div class="absolute inset-0 flex items-center justify-center">
+        <i class="fa-solid fa-rocket text-crypto-glow text-4xl animate-pulse drop-shadow-[0_0_15px_#00f0ff]"></i>
       </div>
     </div>
-    <h2 class="text-white font-black tracking-[0.3em] text-2xl uppercase bg-clip-text text-transparent bg-gradient-to-r from-crypto-glow via-blue-400 to-purple-500 mb-3 drop-shadow-2xl">Point Play</h2>
-    <p class="text-[10px] text-slate-500 uppercase tracking-widest font-semibold">Premium Experience</p>
+    <h2 class="text-white font-black tracking-[0.25em] text-3xl uppercase bg-clip-text text-transparent bg-gradient-to-r from-crypto-glow via-blue-400 to-indigo-500 mb-2 drop-shadow-lg">Point Play</h2>
+    <div class="flex gap-2 mt-3">
+      <div class="w-2 h-2 bg-crypto-glow rounded-full animate-bounce"></div>
+      <div class="w-2 h-2 bg-blue-500 rounded-full animate-bounce" style="animation-delay: 0.1s"></div>
+      <div class="w-2 h-2 bg-indigo-500 rounded-full animate-bounce" style="animation-delay: 0.2s"></div>
+    </div>
   </div>
 
   <!-- Notification Toast -->
-  <div id="toast-container" class="premium-glass rounded-2xl p-4 flex items-center gap-4">
-    <div id="toast-icon" class="w-12 h-12 rounded-2xl flex shrink-0 items-center justify-center text-xl shadow-inner border">
+  <div id="toast-container" class="glass-card rounded-2xl p-4 flex items-center gap-4">
+    <div id="toast-icon" class="w-12 h-12 rounded-full flex shrink-0 items-center justify-center text-xl shadow-inner">
       <i class="fa-solid fa-bell"></i>
     </div>
-    <div class="flex-1 min-w-0">
-      <h4 id="toast-title" class="text-sm font-black text-white tracking-wide truncate">Notification</h4>
-      <p id="toast-message" class="text-xs text-slate-400 mt-0.5 leading-snug truncate">Message goes here</p>
+    <div class="flex-1">
+      <h4 id="toast-title" class="text-sm font-black text-white tracking-wide">Notification</h4>
+      <p id="toast-message" class="text-xs text-slate-300 mt-0.5 leading-tight">Message goes here</p>
     </div>
   </div>
 
-  <!-- HEADER -->
-  <header id="main-header" class="fixed top-0 left-0 right-0 z-50 w-full premium-glass rounded-b-3xl border-t-0 shadow-2xl transition-transform duration-300" style="padding-top: max(1rem, var(--safe-area-top));">
-    <div class="p-4 flex justify-between items-center max-w-md mx-auto w-full">
-      <div class="flex items-center gap-3 min-w-0 flex-1">
-        <div class="relative w-11 h-11 rounded-full p-[2px] bg-gradient-to-tr from-purple-500 via-crypto-glow to-blue-500 shadow-[0_0_15px_rgba(0,229,255,0.3)] shrink-0">
-          <img id="header-photo" src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=" alt="Profile" class="w-full h-full rounded-full object-cover border-2 border-[#030308] bg-[#0a0a16]">
-          <div class="absolute -bottom-1 -right-1 w-4 h-4 bg-[#030308] rounded-full flex items-center justify-center">
-            <span class="w-2 h-2 rounded-full bg-crypto-success shadow-[0_0_8px_#10b981] animate-pulse"></span>
+  <!-- GLOBAL FIXED HEADER (Always visible) -->
+  <header id="main-header" class="fixed top-0 left-0 right-0 z-50 w-full p-4 glass-card rounded-b-3xl border-b-0 shadow-[0_10px_30px_rgba(0,0,0,0.5)] transition-all duration-300">
+    <div class="flex justify-between items-center max-w-md mx-auto">
+      <div class="flex items-center gap-3">
+        <div class="relative w-12 h-12 rounded-full p-[2px] bg-gradient-to-tr from-blue-600 via-crypto-glow to-indigo-500 shadow-[0_0_20px_rgba(0,240,255,0.3)]">
+          <img id="user-photo" src="https://via.placeholder.com/150/0a0b1a/00f0ff?text=PP" alt="Profile" class="w-full h-full rounded-full object-cover border-[3px] border-[#050511]">
+        </div>
+        <div class="flex flex-col">
+          <span id="user-name" class="font-bold text-white text-[15px] tracking-wide leading-tight">Loading...</span>
+          <div class="flex items-center gap-1.5 mt-0.5">
+            <span class="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_10px_#34d399] animate-pulse"></span>
+            <span class="text-[10px] text-slate-400 uppercase font-black tracking-widest">Online</span>
           </div>
         </div>
-        <div class="flex flex-col min-w-0">
-          <span id="header-name" class="font-bold text-white text-sm tracking-wide truncate">Loading...</span>
-          <span class="text-[10px] text-slate-400 uppercase font-semibold tracking-widest mt-0.5">Dashboard</span>
-        </div>
       </div>
-      <div class="flex flex-col items-end gap-1.5 shrink-0 pl-2">
-        <div class="premium-btn px-3 py-1.5 rounded-xl flex items-center gap-2">
-          <i class="fa-solid fa-bolt text-crypto-glow text-[11px] drop-shadow-[0_0_5px_#00e5ff]"></i>
-          <span id="header-xp" class="text-white font-black text-sm tracking-wide">0</span>
+      <div class="flex flex-col items-end gap-2">
+        <div class="glass-button px-3 py-1.5 rounded-xl flex items-center gap-2">
+          <i class="fa-solid fa-bolt text-crypto-glow text-xs drop-shadow-[0_0_5px_#00f0ff]"></i>
+          <span id="user-xp" class="text-white font-black text-sm tracking-wider">0 <span class="text-[10px] text-crypto-glow">XP</span></span>
+        </div>
+        <div class="bg-emerald-900/40 border border-emerald-500/40 px-3 py-1.5 rounded-xl flex items-center gap-2 shadow-[0_0_10px_rgba(16,185,129,0.15)inset]">
+          <i class="fa-solid fa-dollar-sign text-emerald-400 text-[10px]"></i>
+          <span id="user-usd" class="text-emerald-400 font-black text-xs tracking-wider">0</span>
         </div>
       </div>
     </div>
   </header>
 
-  <!-- BODY CONTENT -->
-  <main class="flex-1 max-w-md w-full mx-auto p-4 pt-[110px] relative w-full overflow-hidden" id="app-content">
+  <!-- MAIN CONTENT CONTAINER (Padded to completely clear header and footer) -->
+  <main class="flex-1 max-w-md w-full mx-auto p-4 pt-28 pb-32 relative" id="app-content">
     
-    <!-- 1. HOME PAGE -->
+    <!-- HOME PAGE -->
     <div id="view-home" class="view-section fade-in space-y-6">
-      <!-- Balance Card -->
-      <div class="relative premium-glass rounded-[2rem] p-6 text-center overflow-hidden flex flex-col items-center justify-center min-h-[260px] animate-pop">
-        <div class="absolute top-0 right-0 w-64 h-64 bg-blue-600/10 rounded-full filter blur-[60px] pointer-events-none"></div>
-        <div class="absolute bottom-0 left-0 w-64 h-64 bg-purple-600/10 rounded-full filter blur-[60px] pointer-events-none"></div>
-        
-        <div class="relative z-10 flex flex-col items-center w-full">
-          <div class="w-16 h-16 rounded-full premium-glass flex items-center justify-center mb-4 shadow-[0_0_30px_rgba(0,229,255,0.2)]">
-             <i class="fa-solid fa-gem text-3xl text-crypto-glow drop-shadow-[0_0_15px_rgba(0,229,255,0.6)]"></i>
+      <div class="relative glass-card rounded-[2rem] p-6 text-center border-t border-t-blue-400/20 overflow-hidden flex flex-col items-center justify-center min-h-[260px]">
+        <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-56 h-56 bg-blue-500/20 rounded-full filter blur-[50px] pointer-events-none animate-pulse-fast"></div>
+        <div class="relative z-10 flex flex-col items-center">
+          <div class="w-16 h-16 rounded-full bg-gradient-to-br from-blue-900/60 to-[#050511] border border-blue-400/40 flex items-center justify-center mb-4 shadow-[0_0_25px_rgba(59,130,246,0.4)]">
+             <i class="fa-solid fa-gem text-3xl text-crypto-glow drop-shadow-[0_0_15px_rgba(0,240,255,0.9)]"></i>
           </div>
-          <p class="text-[10px] font-black text-slate-400 uppercase tracking-[0.3em] mb-2">Total Balance</p>
-          <h1 class="text-5xl font-black text-transparent bg-clip-text bg-gradient-to-br from-white via-cyan-50 to-blue-300 tracking-tighter drop-shadow-2xl mb-1" id="home-xp-display">0 XP</h1>
-          <p class="text-xs font-bold text-emerald-400 bg-emerald-500/10 px-3 py-1 rounded-full border border-emerald-500/20 mt-2">≈ $<span id="home-usd-display">0.00</span></p>
+          <p class="text-[11px] font-black text-blue-400 uppercase tracking-[0.3em] mb-1 opacity-90">Total Balance</p>
+          <h1 class="text-5xl font-black text-transparent bg-clip-text bg-gradient-to-b from-white via-cyan-100 to-blue-500 tracking-tighter drop-shadow-2xl" id="main-xp-display">0 XP</h1>
         </div>
-
-        <div class="w-full mt-6 grid grid-cols-2 gap-3 relative z-10">
-          <div class="bg-black/40 border border-white/5 p-3 rounded-2xl flex items-center gap-3 backdrop-blur-md">
-            <div class="bg-blue-500/10 p-2.5 rounded-xl border border-blue-500/20 text-blue-400"><i class="fa-solid fa-clapperboard"></i></div>
+        <div class="w-full mt-8 grid grid-cols-2 gap-4">
+          <div class="bg-[#050511]/60 border border-slate-700/60 p-4 rounded-2xl flex items-center gap-3 backdrop-blur-md shadow-inner">
+            <div class="bg-blue-500/10 p-3 rounded-xl border border-blue-500/30"><i class="fa-solid fa-clapperboard text-blue-400"></i></div>
             <div class="text-left">
-              <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider">Ads</p>
-              <p class="text-sm font-black text-white"><span id="home-ads-watched" class="text-blue-400">0</span>/30</p>
+              <p class="text-[10px] text-slate-500 uppercase font-black tracking-wider">Ads Limit</p>
+              <p class="text-base font-black text-white"><span id="ads-watched" class="text-blue-400">0</span> / 30</p>
             </div>
           </div>
-          <div class="bg-black/40 border border-white/5 p-3 rounded-2xl flex items-center gap-3 backdrop-blur-md">
-            <div class="bg-amber-500/10 p-2.5 rounded-xl border border-amber-500/20 text-amber-400"><i class="fa-solid fa-fire"></i></div>
+          <div class="bg-[#050511]/60 border border-slate-700/60 p-4 rounded-2xl flex items-center gap-3 backdrop-blur-md shadow-inner">
+            <div class="bg-amber-500/10 p-3 rounded-xl border border-amber-500/30"><i class="fa-solid fa-fire-flame-curved text-amber-400"></i></div>
             <div class="text-left">
-              <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider">Streak</p>
-              <p class="text-sm font-black text-white"><span id="home-streak" class="text-amber-400">1</span> Days</p>
+              <p class="text-[10px] text-slate-500 uppercase font-black tracking-wider">Streak</p>
+              <p class="text-base font-black text-white"><span id="streak-days" class="text-amber-400">1</span> Days</p>
             </div>
           </div>
         </div>
       </div>
 
-      <!-- Action Button -->
-      <button onclick="watchAd()" id="watch-ad-btn" class="w-full py-4 rounded-2xl text-white font-black text-sm tracking-widest uppercase flex items-center justify-center gap-3 shadow-[0_10px_30px_rgba(59,130,246,0.4)] action-btn group border border-blue-400/30">
-        <div class="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent -translate-x-full group-hover:animate-[shimmer_2s_infinite]"></div>
-        <div class="bg-white/20 p-2 rounded-full flex items-center justify-center backdrop-blur-sm"><i class="fa-solid fa-play text-[10px]"></i></div> 
-        <span>Watch Ad <span class="text-cyan-200 ml-1 font-extrabold">+20 XP</span></span>
+      <button onclick="watchAd()" id="watch-ad-btn" class="w-full py-4 rounded-2xl text-white font-black text-sm tracking-[0.15em] uppercase flex items-center justify-center gap-3 shadow-[0_15px_30px_rgba(59,130,246,0.4)] btn-3d relative overflow-hidden group">
+        <div class="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent -translate-x-full group-hover:animate-[shimmer_1.5s_infinite]"></div>
+        <i class="fa-solid fa-play bg-white/20 p-2.5 rounded-full text-[12px] drop-shadow-lg"></i> 
+        <span>Watch Ad <span class="text-cyan-200 ml-1">+20 XP</span></span>
       </button>
 
-      <div class="premium-glass rounded-xl p-3.5 flex justify-between items-center text-sm border-white/5">
-        <div class="flex items-center gap-2 text-slate-400">
-          <i class="fa-solid fa-clock text-crypto-glow/70"></i> <span class="text-xs font-semibold">Next Reset</span>
+      <div class="glass-card rounded-2xl p-4 flex justify-between items-center border border-slate-800">
+        <div class="flex items-center gap-2 text-slate-400 text-xs font-bold">
+          <i class="fa-solid fa-clock text-blue-400"></i> <span class="uppercase tracking-widest">Resets in:</span>
         </div>
-        <span class="text-white font-mono font-bold tracking-widest bg-black/40 px-3 py-1 rounded-lg border border-white/5" id="reset-timer">--:--:--</span>
+        <span class="text-white font-mono font-black text-sm tracking-widest bg-slate-900/50 px-3 py-1 rounded-lg" id="reset-timer">--:--:--</span>
       </div>
     </div>
 
-    <!-- 2. TASKS PAGE -->
-    <div id="view-tasks" class="view-section hidden fade-in space-y-5 pb-4">
-      <div class="text-left pt-2 pb-1">
-        <h2 class="text-3xl font-black text-white tracking-tight drop-shadow-lg">Earn XP</h2>
-        <p class="text-xs text-slate-400 mt-1 uppercase tracking-widest font-semibold">Complete missions & claim rewards</p>
+    <!-- TASKS PAGE -->
+    <div id="view-tasks" class="view-section hidden fade-in space-y-6">
+      <div class="text-center mb-2">
+        <h2 class="text-3xl font-black text-white tracking-tight drop-shadow-lg">Tasks</h2>
+        <p class="text-xs text-crypto-glow mt-1 uppercase tracking-widest font-bold">Complete & Earn</p>
       </div>
       
-      <!-- ONLY ONE Daily Login (Streak Tracker) -->
-      <div class="premium-glass rounded-[1.5rem] p-5 relative overflow-hidden border-t border-t-crypto-glow/30">
-        <div class="absolute -right-10 -top-10 w-40 h-40 bg-blue-600/10 rounded-full blur-3xl pointer-events-none"></div>
-        
-        <div class="flex justify-between items-center mb-5 relative z-10">
-          <h3 class="text-xs font-black text-white uppercase tracking-widest flex items-center gap-2">
-            <div class="w-7 h-7 rounded-lg bg-crypto-glow/10 border border-crypto-glow/30 flex items-center justify-center">
-              <i class="fa-solid fa-calendar-check text-crypto-glow text-sm"></i>
+      <!-- DAILY LOGIN - EXACTLY ONE TASK CARD -->
+      <div class="glass-card rounded-[1.5rem] p-5 relative overflow-hidden border border-crypto-glow shadow-[0_0_20px_rgba(0,240,255,0.15)] bg-gradient-to-br from-blue-900/30 to-[#050511]">
+        <div class="absolute -right-10 -top-10 w-32 h-32 bg-crypto-glow/20 rounded-full blur-3xl"></div>
+        <div class="relative z-10 flex flex-col gap-4">
+            <div class="flex justify-between items-start">
+                <div class="flex items-center gap-3">
+                    <div class="w-12 h-12 rounded-xl bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center shadow-lg">
+                        <i class="fa-solid fa-calendar-day text-2xl text-white"></i>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-black text-white tracking-wide">Daily Login</h3>
+                        <p class="text-[10px] text-cyan-400 font-bold uppercase tracking-widest mt-0.5">Keep your streak alive</p>
+                    </div>
+                </div>
+                <!-- Dynamic Claim Button injected via JS -->
+                <div id="daily-login-btn-container"></div>
             </div>
-            Daily Login
-          </h3>
-          <span class="text-[9px] bg-blue-500/20 text-blue-400 px-2 py-1 rounded-lg border border-blue-500/30 font-bold uppercase tracking-wider">Top Task</span>
-        </div>
-        
-        <div class="relative flex justify-between items-center w-full" id="daily-login-container">
-          <!-- Populated by JS -->
+            
+            <div class="bg-[#050511]/60 rounded-xl p-4 border border-slate-700/50">
+                <div class="relative flex justify-between items-center" id="streak-tracker-container">
+                    <!-- Populated by JS -->
+                </div>
+            </div>
         </div>
       </div>
 
-      <!-- Other Missions -->
-      <div>
-        <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] pl-2 mb-3 mt-2 flex items-center gap-2"><i class="fa-solid fa-list text-slate-600"></i> Standard Missions</h3>
+      <!-- MISSIONS SECTION (No Share Task) -->
+      <div class="mt-8">
+        <h3 class="text-[11px] font-black text-slate-500 uppercase tracking-[0.2em] pl-2 mb-4 flex items-center gap-2">
+            <i class="fa-solid fa-list-check text-slate-600"></i> Daily Missions
+        </h3>
         <div id="missions-container" class="space-y-3">
-          <!-- Populated by JS (No Daily Share, No duplicate Daily Login) -->
-        </div>
-      </div>
-      
-      <!-- Sponsored Tasks -->
-      <div>
-        <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] pl-2 mb-3 mt-4 flex items-center gap-2"><i class="fa-solid fa-star text-slate-600"></i> Sponsored</h3>
-        <div id="azx-task-container">
           <!-- Populated by JS -->
         </div>
       </div>
     </div>
 
-    <!-- 3. BOXES PAGE -->
-    <div id="view-boxes" class="view-section hidden fade-in space-y-4 pb-4">
-      <div class="text-left pt-2 pb-2">
-        <h2 class="text-3xl font-black text-white tracking-tight drop-shadow-lg">Mystery Boxes</h2>
-        <p class="text-xs text-crypto-gold mt-1 uppercase tracking-widest font-bold">Exchange XP for USDT</p>
+    <!-- REFERRANS PAGE -->
+    <div id="view-referrals" class="view-section hidden fade-in space-y-6">
+      <div class="text-center relative mb-2">
+        <h2 class="text-3xl font-black text-white tracking-tight drop-shadow-lg">Referans</h2>
+        <p class="text-xs text-blue-400 mt-1 uppercase tracking-widest font-bold">Invite & Earn</p>
+        <button onclick="toggleRefInfo()" class="absolute top-1 right-1 w-9 h-9 rounded-full bg-blue-500/20 border border-blue-500/50 flex items-center justify-center text-blue-400 active:scale-90 transition-transform shadow-[0_0_15px_rgba(59,130,246,0.3)]">
+          <i class="fa-solid fa-circle-question text-lg"></i>
+        </button>
       </div>
-      
-      <div class="box-bronze rounded-[1.5rem] p-5 relative overflow-hidden flex justify-between items-center transition-all duration-300 hover:scale-[1.02] shadow-[0_10px_30px_rgba(212,136,85,0.1)] group">
-        <div class="absolute -right-10 top-1/2 -translate-y-1/2 w-40 h-40 bg-crypto-bronze/10 rounded-full blur-3xl pointer-events-none group-hover:bg-crypto-bronze/20 transition-colors"></div>
-        <div class="flex items-center gap-4 relative z-10">
-          <div class="w-14 h-14 rounded-2xl bg-gradient-to-br from-[#5a3a24] to-[#1a100a] border border-crypto-bronze/50 flex items-center justify-center shadow-inner relative">
-            <i class="fa-solid fa-box text-2xl text-crypto-bronze drop-shadow-[0_0_10px_rgba(212,136,85,0.5)]"></i>
-          </div>
-          <div>
-            <h3 class="text-lg font-black text-white tracking-wide">Bronze Box</h3>
-            <div class="flex flex-col gap-1 mt-1">
-              <span class="text-[10px] text-white/80 font-bold tracking-wider uppercase bg-black/40 px-2 py-0.5 rounded inline-block w-fit border border-white/10"><i class="fa-solid fa-bolt text-crypto-glow mr-1"></i> 10,000 XP</span>
-              <span class="text-[10px] text-emerald-400 font-bold uppercase tracking-wider">Win up to $1.00</span>
-            </div>
-          </div>
+
+      <div class="grid grid-cols-3 gap-3">
+        <div class="glass-card p-4 rounded-[1.25rem] text-center border-t-2 border-t-blue-500/40 shadow-lg">
+          <p class="text-[10px] text-slate-400 uppercase font-black tracking-widest mb-1">Total</p>
+          <p id="ref-total" class="text-2xl font-black text-white drop-shadow-md">0</p>
         </div>
-        <button onclick="openBox('bronze')" class="relative z-10 bg-gradient-to-b from-[#d48855] to-[#a65d2a] text-white shadow-[0_5px_15px_rgba(212,136,85,0.4)] hover:brightness-110 active:scale-95 transition-all px-5 py-2.5 rounded-xl text-xs font-black uppercase tracking-widest border border-[#f5a875]">Open</button>
-      </div>
-
-      <div class="box-silver rounded-[1.5rem] p-5 relative overflow-hidden flex justify-between items-center transition-all duration-300 hover:scale-[1.02] shadow-[0_10px_30px_rgba(226,232,240,0.05)] group">
-        <div class="absolute -right-10 top-1/2 -translate-y-1/2 w-40 h-40 bg-crypto-silver/10 rounded-full blur-3xl pointer-events-none group-hover:bg-crypto-silver/20 transition-colors"></div>
-        <div class="flex items-center gap-4 relative z-10">
-          <div class="w-14 h-14 rounded-2xl bg-gradient-to-br from-[#475569] to-[#0f172a] border border-crypto-silver/50 flex items-center justify-center shadow-inner relative">
-            <i class="fa-solid fa-box-open text-2xl text-crypto-silver drop-shadow-[0_0_10px_rgba(226,232,240,0.5)]"></i>
-          </div>
-          <div>
-            <h3 class="text-lg font-black text-white tracking-wide">Silver Box</h3>
-            <div class="flex flex-col gap-1 mt-1">
-              <span class="text-[10px] text-white/80 font-bold tracking-wider uppercase bg-black/40 px-2 py-0.5 rounded inline-block w-fit border border-white/10"><i class="fa-solid fa-bolt text-crypto-glow mr-1"></i> 50,000 XP</span>
-              <span class="text-[10px] text-emerald-400 font-bold uppercase tracking-wider">Win up to $7.00</span>
-            </div>
-          </div>
+        <div class="glass-card p-4 rounded-[1.25rem] text-center border-t-2 border-t-amber-500/40 shadow-lg">
+          <p class="text-[10px] text-slate-400 uppercase font-black tracking-widest mb-1">Pending</p>
+          <p id="ref-pending" class="text-2xl font-black text-amber-400 drop-shadow-md">0</p>
         </div>
-        <button onclick="openBox('silver')" class="relative z-10 bg-gradient-to-b from-[#94a3b8] to-[#475569] text-white shadow-[0_5px_15px_rgba(148,163,184,0.4)] hover:brightness-110 active:scale-95 transition-all px-5 py-2.5 rounded-xl text-xs font-black uppercase tracking-widest border border-[#cbd5e1]">Open</button>
-      </div>
-
-      <div class="box-gold rounded-[1.5rem] p-5 relative overflow-hidden flex justify-between items-center transition-all duration-300 hover:scale-[1.02] shadow-[0_10px_30px_rgba(255,215,0,0.15)] group">
-        <div class="absolute -right-10 top-1/2 -translate-y-1/2 w-40 h-40 bg-crypto-gold/15 rounded-full blur-3xl pointer-events-none group-hover:bg-crypto-gold/25 transition-colors animate-pulse-fast"></div>
-        <div class="flex items-center gap-4 relative z-10">
-          <div class="w-14 h-14 rounded-2xl bg-gradient-to-br from-[#856500] to-[#241a00] border border-crypto-gold/60 flex items-center justify-center shadow-inner relative">
-            <i class="fa-solid fa-gem text-2xl text-crypto-gold drop-shadow-[0_0_15px_#ffd700]"></i>
-          </div>
-          <div>
-            <h3 class="text-lg font-black text-crypto-gold tracking-wide drop-shadow-[0_0_5px_rgba(255,215,0,0.5)]">Gold Box</h3>
-            <div class="flex flex-col gap-1 mt-1">
-              <span class="text-[10px] text-white/80 font-bold tracking-wider uppercase bg-black/40 px-2 py-0.5 rounded inline-block w-fit border border-white/10"><i class="fa-solid fa-bolt text-crypto-glow mr-1"></i> 100,000 XP</span>
-              <span class="text-[10px] text-emerald-400 font-bold uppercase tracking-wider">Win up to $15.00</span>
-            </div>
-          </div>
-        </div>
-        <button onclick="openBox('gold')" class="relative z-10 bg-gradient-to-b from-[#ffd700] to-[#b38600] text-black shadow-[0_5px_20px_rgba(255,215,0,0.5)] hover:brightness-110 active:scale-95 transition-all px-5 py-2.5 rounded-xl text-xs font-black uppercase tracking-widest border border-[#ffeb73]">Open</button>
-      </div>
-    </div>
-
-    <!-- 4. WALLET PAGE (Withdraw) -->
-    <div id="view-withdraw" class="view-section hidden fade-in space-y-6 pb-4">
-      <div class="text-left pt-2 pb-1">
-        <h2 class="text-3xl font-black text-white tracking-tight drop-shadow-lg">Wallet</h2>
-        <p class="text-xs text-slate-400 mt-1 uppercase tracking-widest font-semibold">Withdraw your earnings</p>
-      </div>
-
-      <div class="premium-glass rounded-[2rem] p-6 text-center border-t border-emerald-500/30 bg-gradient-to-b from-emerald-900/20 to-transparent relative overflow-hidden">
-        <div class="absolute top-0 right-0 w-48 h-48 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none"></div>
-        <p class="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em] mb-2 relative z-10">Available Balance</p>
-        <h1 class="text-5xl font-black text-white tracking-tighter mb-4 relative z-10 drop-shadow-lg flex items-center justify-center gap-2">
-          $<span id="wallet-balance">0</span>
-        </h1>
-        <div class="inline-flex items-center gap-2 bg-black/50 backdrop-blur-md px-4 py-2 rounded-xl border border-white/10 relative z-10">
-          <div class="w-6 h-6 rounded-full bg-[#0098EA] flex items-center justify-center p-1">
-            <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" class="w-full h-full text-white"><path d="M12 22C17.5228 22 22 17.5228 22 12C22 6.47715 17.5228 2 12 2C6.47715 2 2 6.47715 2 12C2 17.5228 6.47715 22 12 22Z" fill="#0098EA"/><path d="M16.5 8H7.5C6.67157 8 6 8.67157 6 9.5C6 10.3284 6.67157 11 7.5 11H16.5C17.3284 11 18 10.3284 18 9.5C18 8.67157 17.3284 8 16.5 8Z" fill="white"/><path d="M12 11V17M12 17L9.5 14.5M12 17L14.5 14.5" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          </div>
-          <span class="text-xs font-bold text-slate-200 uppercase tracking-widest">USDT (TON Network)</span>
+        <div class="glass-card p-4 rounded-[1.25rem] text-center border-t-2 border-t-emerald-500/40 shadow-lg">
+          <p class="text-[10px] text-slate-400 uppercase font-black tracking-widest mb-1">Approved</p>
+          <p id="ref-approved" class="text-2xl font-black text-emerald-400 drop-shadow-md">0</p>
         </div>
       </div>
 
-      <div class="premium-glass rounded-[1.5rem] p-5 space-y-5 border-white/5 relative z-10">
-        <!-- Minimum Alert -->
-        <div class="bg-blue-500/10 border border-blue-500/20 rounded-xl p-3 flex gap-3 items-start">
-          <i class="fa-solid fa-circle-info text-blue-400 mt-0.5"></i>
-          <div>
-            <p class="text-xs font-bold text-white mb-0.5">Withdrawal Requirements</p>
-            <p class="text-[10px] text-slate-400 leading-relaxed">Minimum withdrawal is <strong class="text-emerald-400">$10 USDT</strong>. Withdrawals are processed exclusively via the <strong class="text-blue-400">TON Network</strong>. A valid TON wallet address is required.</p>
-          </div>
-        </div>
-
+      <div class="glass-card rounded-[1.5rem] p-5 space-y-4 border border-slate-700/50">
         <div>
-          <label class="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 ml-1">TON Wallet Address <span class="text-red-400">*</span></label>
-          <div class="relative group">
-            <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
-              <i class="fa-solid fa-wallet text-slate-500 group-focus-within:text-blue-400 transition-colors"></i>
-            </div>
-            <input type="text" id="wallet-address" placeholder="UQ..." class="w-full bg-black/40 border border-white/10 rounded-xl py-3.5 pl-11 pr-4 text-sm font-medium text-white focus:outline-none focus:border-blue-500 focus:bg-black/60 transition-all placeholder-slate-600 shadow-inner">
+          <label class="block text-[11px] font-black text-slate-400 uppercase tracking-[0.15em] mb-2 ml-1">Your Referral Link</label>
+          <div class="flex items-center gap-2">
+            <input type="text" id="ref-link-input" readonly class="flex-1 bg-[#050511]/70 border border-slate-700 rounded-xl py-3.5 px-4 text-xs font-medium text-slate-300 focus:outline-none shadow-inner">
+            <button onclick="copyRefLink()" class="bg-slate-800 text-white w-12 h-12 rounded-xl flex items-center justify-center active:scale-95 transition-transform border border-slate-600 hover:bg-slate-700 shadow-md">
+              <i class="fa-regular fa-copy text-lg"></i>
+            </button>
           </div>
         </div>
-        
-        <div>
-          <label class="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 ml-1">Amount (USDT)</label>
-          <div class="relative group">
-            <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
-              <i class="fa-solid fa-dollar-sign text-slate-500 group-focus-within:text-emerald-400 transition-colors text-lg"></i>
-            </div>
-            <input type="number" id="withdraw-amount" placeholder="10" min="10" step="0.5" class="w-full bg-black/40 border border-white/10 rounded-xl py-3.5 pl-11 pr-4 text-sm font-bold text-emerald-400 focus:outline-none focus:border-emerald-500 focus:bg-black/60 transition-all placeholder-slate-600 shadow-inner">
-          </div>
-        </div>
-
-        <button onclick="requestWithdrawal()" id="withdraw-btn" class="w-full py-4 mt-2 bg-gradient-to-r from-emerald-600 to-teal-500 hover:from-emerald-500 hover:to-teal-400 active:scale-95 transition-all text-white font-black rounded-xl text-sm uppercase tracking-widest flex items-center justify-center gap-2 shadow-[0_10px_20px_rgba(16,185,129,0.2)] border border-emerald-400/30">
-          Request Withdrawal <i class="fa-solid fa-arrow-right ml-1"></i>
+        <button onclick="shareReferralTelegram()" class="w-full py-4 bg-gradient-to-r from-blue-600 to-cyan-500 text-white font-black rounded-xl text-sm uppercase tracking-wider flex items-center justify-center gap-3 shadow-[0_5px_20px_rgba(0,240,255,0.3)] active:scale-95 transition-transform hover:brightness-110">
+          <i class="fa-brands fa-telegram text-xl"></i> Share via Telegram
         </button>
       </div>
 
       <div>
-        <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] pl-2 mb-3"><i class="fa-solid fa-clock-rotate-left mr-1"></i> History</h3>
+        <h3 class="text-[11px] font-black text-slate-500 uppercase tracking-[0.2em] pl-2 mb-4 flex items-center gap-2">
+          <i class="fa-solid fa-users text-slate-600"></i> Your Referrals
+        </h3>
+        <div id="referral-list-container" class="space-y-3">
+          <!-- Populated dynamically -->
+        </div>
+      </div>
+
+      <div class="mt-8">
+        <h3 class="text-[11px] font-black text-slate-500 uppercase tracking-[0.2em] pl-2 mb-4 flex items-center gap-2 border-t border-slate-800/80 pt-6">
+          <i class="fa-solid fa-gift text-slate-600"></i> Reward History
+        </h3>
+        <div id="referral-rewards-container" class="space-y-3">
+          <!-- Populated dynamically -->
+        </div>
+      </div>
+    </div>
+
+    <!-- BOX PAGE -->
+    <div id="view-boxes" class="view-section hidden fade-in space-y-5">
+      <div class="text-center mb-6">
+        <h2 class="text-3xl font-black text-white tracking-tight drop-shadow-lg">Box</h2>
+        <p class="text-xs text-amber-400 mt-1 uppercase tracking-widest font-bold">Try Your Luck, Win USDT</p>
+      </div>
+      
+      <!-- Bronze -->
+      <div class="box-bronze glass-card rounded-[1.5rem] p-5 relative overflow-hidden flex justify-between items-center transition-transform hover:scale-[1.02] shadow-lg">
+        <div class="absolute -right-4 top-1/2 -translate-y-1/2 w-32 h-32 bg-crypto-bronze/20 rounded-full blur-2xl"></div>
+        <div class="flex items-center gap-4 relative z-10">
+          <div class="w-14 h-14 rounded-2xl bg-gradient-to-br from-orange-900 to-[#050511] border border-crypto-bronze flex items-center justify-center shadow-[0_0_20px_rgba(205,127,50,0.3)]">
+            <i class="fa-solid fa-box text-3xl text-crypto-bronze"></i>
+          </div>
+          <div>
+            <h3 class="text-xl font-black text-white tracking-wide">Bronze Box</h3>
+            <div class="flex flex-col mt-1">
+              <span class="text-[11px] text-slate-400 font-bold tracking-wider uppercase flex items-center"><i class="fa-solid fa-bolt text-crypto-glow mr-1.5"></i> 10,000 XP</span>
+              <span class="text-xs text-emerald-400 font-bold mt-0.5">Max Reward: $1.00 USDT</span>
+            </div>
+          </div>
+        </div>
+        <button onclick="openBox('bronze')" class="relative z-10 bg-gradient-to-b from-orange-600 to-orange-800 text-white shadow-[0_4px_15px_rgba(205,127,50,0.5)] hover:brightness-110 active:scale-95 transition-all px-5 py-2.5 rounded-xl text-sm font-black uppercase tracking-wider">Open</button>
+      </div>
+
+      <!-- Silver -->
+      <div class="box-silver glass-card rounded-[1.5rem] p-5 relative overflow-hidden flex justify-between items-center transition-transform hover:scale-[1.02] shadow-lg">
+        <div class="absolute -right-4 top-1/2 -translate-y-1/2 w-32 h-32 bg-crypto-silver/20 rounded-full blur-2xl"></div>
+        <div class="flex items-center gap-4 relative z-10">
+          <div class="w-14 h-14 rounded-2xl bg-gradient-to-br from-slate-600 to-[#050511] border border-crypto-silver flex items-center justify-center shadow-[0_0_20px_rgba(226,232,240,0.3)]">
+            <i class="fa-solid fa-box-open text-3xl text-crypto-silver drop-shadow-md"></i>
+          </div>
+          <div>
+            <h3 class="text-xl font-black text-white tracking-wide">Silver Box</h3>
+            <div class="flex flex-col mt-1">
+              <span class="text-[11px] text-slate-400 font-bold tracking-wider uppercase flex items-center"><i class="fa-solid fa-bolt text-crypto-glow mr-1.5"></i> 50,000 XP</span>
+              <span class="text-xs text-emerald-400 font-bold mt-0.5">Max Reward: $7.00 USDT</span>
+            </div>
+          </div>
+        </div>
+        <button onclick="openBox('silver')" class="relative z-10 bg-gradient-to-b from-slate-300 to-slate-500 text-crypto-dark shadow-[0_4px_15px_rgba(226,232,240,0.4)] hover:brightness-110 active:scale-95 transition-all px-5 py-2.5 rounded-xl text-sm font-black uppercase tracking-wider">Open</button>
+      </div>
+
+      <!-- Gold -->
+      <div class="box-gold glass-card rounded-[1.5rem] p-5 relative overflow-hidden flex justify-between items-center border-2 border-crypto-gold shadow-[0_0_30px_rgba(255,184,0,0.2)] transition-transform hover:scale-[1.02]">
+        <div class="absolute -right-4 top-1/2 -translate-y-1/2 w-40 h-40 bg-crypto-gold/25 rounded-full blur-2xl animate-pulse"></div>
+        <div class="flex items-center gap-4 relative z-10">
+          <div class="w-14 h-14 rounded-2xl bg-gradient-to-br from-amber-500 to-[#050511] border-2 border-crypto-gold flex items-center justify-center shadow-[0_0_30px_rgba(255,184,0,0.6)]">
+            <i class="fa-solid fa-gem text-3xl text-crypto-gold drop-shadow-[0_0_15px_#ffb800]"></i>
+          </div>
+          <div>
+            <h3 class="text-xl font-black text-crypto-gold tracking-wide drop-shadow-[0_0_5px_rgba(255,184,0,0.5)]">Gold Box</h3>
+            <div class="flex flex-col mt-1">
+              <span class="text-[11px] text-amber-200/80 font-bold tracking-wider uppercase flex items-center"><i class="fa-solid fa-bolt text-crypto-glow mr-1.5"></i> 100,000 XP</span>
+              <span class="text-xs text-emerald-400 font-bold mt-0.5">Max Reward: $15.00 USDT</span>
+            </div>
+          </div>
+        </div>
+        <button onclick="openBox('gold')" class="relative z-10 bg-gradient-to-b from-yellow-400 to-amber-600 text-crypto-dark shadow-[0_5px_20px_rgba(255,184,0,0.7)] hover:brightness-110 active:scale-95 transition-all px-5 py-2.5 rounded-xl text-sm font-black uppercase tracking-wider">Open</button>
+      </div>
+    </div>
+
+    <!-- WALLET PAGE (Withdraw) -->
+    <div id="view-wallet" class="view-section hidden fade-in space-y-6">
+      <div class="text-center mb-2">
+        <h2 class="text-3xl font-black text-white tracking-tight drop-shadow-lg">Wallet</h2>
+        <p class="text-xs text-emerald-400 mt-1 uppercase tracking-widest font-bold">USDT Withdrawal on TON</p>
+      </div>
+
+      <div class="glass-card rounded-[2rem] p-6 text-center border-t-2 border-emerald-500/40 bg-gradient-to-b from-emerald-900/30 to-[#050511] shadow-xl">
+        <div class="w-16 h-16 mx-auto bg-emerald-500/10 rounded-full flex items-center justify-center mb-4 border border-emerald-500/30 shadow-[0_0_30px_rgba(16,185,129,0.25)]">
+          <i class="fa-brands fa-usdt text-3xl text-emerald-400 drop-shadow-lg"></i>
+        </div>
+        <p class="text-[11px] font-black text-emerald-400 uppercase tracking-[0.2em] mb-1 opacity-90">Available USDT</p>
+        <h1 class="text-5xl font-black text-white tracking-tighter mb-4">$<span id="withdraw-balance-display">0</span></h1>
+        <div class="inline-block bg-[#050511]/80 backdrop-blur-md px-4 py-2 rounded-full border border-emerald-500/30 shadow-inner">
+          <p class="text-[10px] font-bold text-slate-300 uppercase tracking-widest"><i class="fa-solid fa-circle-info text-emerald-400 mr-1.5"></i> Minimum Withdrawal: $10</p>
+        </div>
+      </div>
+
+      <div class="glass-card rounded-[1.5rem] p-5 space-y-5 border border-slate-700/60 shadow-lg">
+        
+        <div class="bg-blue-900/20 border border-blue-500/30 p-3 rounded-xl flex items-start gap-3">
+            <i class="fa-solid fa-shield-halved text-blue-400 mt-0.5"></i>
+            <div>
+                <p class="text-[10px] font-bold text-blue-300 uppercase tracking-widest mb-1">Network Details</p>
+                <p class="text-xs text-slate-400 leading-tight">Withdrawals are processed strictly via <strong class="text-white">USDT</strong> on the <strong class="text-white">TON Network</strong>. Ensure your wallet address supports this.</p>
+            </div>
+        </div>
+
+        <div>
+          <label class="block text-[11px] font-black text-slate-400 uppercase tracking-[0.15em] mb-2 ml-1">TON Wallet Address <span class="text-red-400">*</span></label>
+          <div class="relative group">
+            <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+              <img src="https://cryptologos.cc/logos/toncoin-ton-logo.png" class="w-5 h-5 opacity-70 group-focus-within:opacity-100 transition-opacity" alt="TON">
+            </div>
+            <input type="text" id="wallet-address" placeholder="UQ..." class="w-full bg-[#050511]/70 border-2 border-slate-700/60 rounded-xl py-3.5 pl-12 pr-4 text-sm font-medium text-white focus:outline-none focus:border-blue-500 transition-colors placeholder-slate-600 shadow-inner">
+          </div>
+        </div>
+        
+        <div>
+          <label class="block text-[11px] font-black text-slate-400 uppercase tracking-[0.15em] mb-2 ml-1">Amount (USDT) <span class="text-red-400">*</span></label>
+          <div class="relative group">
+            <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+              <i class="fa-solid fa-dollar-sign text-slate-500 group-focus-within:text-emerald-400 transition-colors text-lg"></i>
+            </div>
+            <input type="number" id="withdraw-amount" placeholder="10" min="10" step="0.5" class="w-full bg-[#050511]/70 border-2 border-slate-700/60 rounded-xl py-3.5 pl-12 pr-4 text-sm font-bold text-emerald-400 focus:outline-none focus:border-emerald-500 transition-colors placeholder-slate-600 shadow-inner">
+          </div>
+        </div>
+
+        <button onclick="requestWithdrawal()" id="withdraw-btn" class="w-full py-4 mt-2 bg-gradient-to-r from-emerald-600 to-teal-500 hover:brightness-110 active:scale-95 transition-all text-white font-black rounded-xl text-sm uppercase tracking-[0.15em] flex items-center justify-center gap-3 shadow-[0_10px_25px_rgba(16,185,129,0.4)]">
+          <i class="fa-solid fa-money-bill-transfer text-lg"></i> Request Withdrawal
+        </button>
+      </div>
+
+      <div class="mt-8">
+        <h3 class="text-[11px] font-black text-slate-500 uppercase tracking-[0.2em] pl-2 mb-4 flex items-center gap-2">
+          <i class="fa-solid fa-clock-rotate-left text-slate-600"></i> Withdrawal History
+        </h3>
         <div id="withdraw-history-container" class="space-y-3">
           <!-- Populated via JS -->
         </div>
       </div>
     </div>
 
-    <!-- 5. PROFILE PAGE -->
-    <div id="view-profile" class="view-section hidden fade-in space-y-5 pb-4">
+    <!-- PROFILE PAGE (NEW) -->
+    <div id="view-profile" class="view-section hidden fade-in space-y-6">
+      
       <!-- Profile Header -->
-      <div class="premium-glass rounded-[2rem] p-6 text-center border-t border-purple-500/30 relative overflow-hidden">
-        <div class="absolute top-0 right-0 w-32 h-32 bg-purple-600/20 rounded-full blur-3xl pointer-events-none"></div>
+      <div class="glass-card rounded-[2rem] p-6 flex flex-col items-center justify-center border-t border-t-blue-500/30 shadow-xl relative overflow-hidden">
+        <div class="absolute top-0 right-0 w-40 h-40 bg-blue-600/10 rounded-full blur-3xl pointer-events-none"></div>
+        <div class="absolute bottom-0 left-0 w-40 h-40 bg-indigo-600/10 rounded-full blur-3xl pointer-events-none"></div>
         
-        <div class="w-24 h-24 mx-auto rounded-full p-1 bg-gradient-to-tr from-purple-500 via-crypto-glow to-blue-500 shadow-[0_0_25px_rgba(124,58,237,0.3)] mb-4 relative z-10">
-          <img id="profile-photo" src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=" alt="Profile" class="w-full h-full rounded-full object-cover border-4 border-[#030308] bg-[#0a0a16]">
+        <div class="relative z-10 w-24 h-24 rounded-full p-1 bg-gradient-to-tr from-blue-500 via-crypto-glow to-purple-500 shadow-[0_0_30px_rgba(0,240,255,0.3)] mb-4">
+          <img id="profile-page-avatar" src="" alt="Avatar" class="w-full h-full rounded-full object-cover border-4 border-[#050511]">
+          <div class="absolute bottom-0 right-0 w-6 h-6 bg-emerald-500 border-2 border-[#050511] rounded-full flex items-center justify-center shadow-lg">
+            <i class="fa-solid fa-check text-[10px] text-white"></i>
+          </div>
         </div>
-        
-        <h3 id="profile-full-name" class="text-xl font-black text-white tracking-wide truncate px-4 relative z-10">Name</h3>
-        <p id="profile-username" class="text-xs text-crypto-glow font-medium mt-1 truncate px-4 relative z-10">@username</p>
-        <p class="text-[10px] text-slate-500 font-mono mt-2 bg-black/40 inline-block px-3 py-1 rounded-lg border border-white/5 relative z-10">ID: <span id="profile-id">00000</span></p>
-      </div>
 
-      <!-- Level & Progress -->
-      <div class="premium-glass rounded-2xl p-5 border-white/5">
-        <div class="flex justify-between items-end mb-3">
-          <div>
-            <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-1.5"><i class="fa-solid fa-ranking-star text-purple-400"></i> Current Level</p>
-            <p class="text-lg font-black text-white mt-1">Level <span id="profile-level" class="text-purple-400">1</span></p>
-          </div>
-          <div class="text-right">
-            <span id="profile-percent" class="text-xs font-black text-crypto-glow block mb-1">0%</span>
-            <p class="text-[10px] font-bold text-slate-500"><span id="profile-current-xp" class="text-white">0</span> / <span id="profile-next-xp">250</span> XP</p>
-          </div>
-        </div>
-        <div class="w-full bg-black/50 rounded-full h-2 overflow-hidden shadow-inner border border-white/5">
-          <div id="profile-progress-bar" class="bg-gradient-to-r from-purple-500 via-blue-500 to-crypto-glow h-full rounded-full shadow-[0_0_10px_#00e5ff] transition-all duration-1000" style="width: 0%"></div>
+        <h2 id="profile-page-name" class="text-2xl font-black text-white tracking-wide mb-1 break-words text-center max-w-full">Name</h2>
+        <p id="profile-page-username" class="text-sm font-mono text-blue-400 mb-3 bg-blue-500/10 px-3 py-1 rounded-full border border-blue-500/20 break-words max-w-full">@username</p>
+        
+        <div class="flex items-center gap-2 bg-[#050511]/60 px-4 py-2 rounded-xl border border-slate-700/50">
+            <i class="fa-brands fa-telegram text-slate-400"></i>
+            <span class="text-[10px] text-slate-400 uppercase font-bold tracking-widest">ID: <span id="profile-page-id" class="text-white ml-1">0000000</span></span>
         </div>
       </div>
 
       <!-- Stats Grid -->
-      <div class="grid grid-cols-2 gap-3">
-        <div class="premium-glass border border-white/5 p-4 rounded-2xl flex flex-col items-center justify-center text-center">
-          <div class="w-8 h-8 rounded-full bg-blue-500/10 flex items-center justify-center text-blue-400 mb-2 border border-blue-500/20"><i class="fa-solid fa-bolt"></i></div>
-          <p class="text-[9px] text-slate-400 uppercase font-bold tracking-widest mb-1">Total Earned</p>
-          <p id="profile-total-xp" class="text-sm font-black text-white">0 XP</p>
+      <h3 class="text-[11px] font-black text-slate-500 uppercase tracking-[0.2em] pl-2 mb-2 mt-6 flex items-center gap-2">
+          <i class="fa-solid fa-chart-pie text-slate-600"></i> Account Statistics
+      </h3>
+      
+      <div class="grid grid-cols-2 gap-4">
+        <div class="glass-card p-5 rounded-2xl border-t-2 border-t-crypto-glow/40 shadow-lg flex flex-col items-center justify-center text-center">
+            <div class="w-10 h-10 rounded-full bg-blue-500/10 flex items-center justify-center mb-2">
+                <i class="fa-solid fa-bolt text-crypto-glow text-lg"></i>
+            </div>
+            <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Total XP Earned</p>
+            <p id="profile-stat-xp" class="text-xl font-black text-white">0</p>
         </div>
-        <div class="premium-glass border border-white/5 p-4 rounded-2xl flex flex-col items-center justify-center text-center">
-          <div class="w-8 h-8 rounded-full bg-emerald-500/10 flex items-center justify-center text-emerald-400 mb-2 border border-emerald-500/20"><i class="fa-solid fa-check-double"></i></div>
-          <p class="text-[9px] text-slate-400 uppercase font-bold tracking-widest mb-1">Tasks Done</p>
-          <p id="profile-tasks" class="text-sm font-black text-white">0</p>
+        <div class="glass-card p-5 rounded-2xl border-t-2 border-t-emerald-500/40 shadow-lg flex flex-col items-center justify-center text-center">
+            <div class="w-10 h-10 rounded-full bg-emerald-500/10 flex items-center justify-center mb-2">
+                <i class="fa-solid fa-wallet text-emerald-400 text-lg"></i>
+            </div>
+            <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Current Balance</p>
+            <p id="profile-stat-usd" class="text-xl font-black text-white">$0</p>
         </div>
-        <div class="premium-glass border border-white/5 p-4 rounded-2xl flex flex-col items-center justify-center text-center">
-          <div class="w-8 h-8 rounded-full bg-amber-500/10 flex items-center justify-center text-amber-400 mb-2 border border-amber-500/20"><i class="fa-solid fa-box-open"></i></div>
-          <p class="text-[9px] text-slate-400 uppercase font-bold tracking-widest mb-1">Boxes Opened</p>
-          <p id="profile-boxes" class="text-sm font-black text-white">0</p>
+        <div class="glass-card p-5 rounded-2xl border-t-2 border-t-purple-500/40 shadow-lg flex flex-col items-center justify-center text-center">
+            <div class="w-10 h-10 rounded-full bg-purple-500/10 flex items-center justify-center mb-2">
+                <i class="fa-solid fa-users text-purple-400 text-lg"></i>
+            </div>
+            <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Total Referrals</p>
+            <p id="profile-stat-refs" class="text-xl font-black text-white">0</p>
         </div>
-        <div class="premium-glass border border-white/5 p-4 rounded-2xl flex flex-col items-center justify-center text-center">
-          <div class="w-8 h-8 rounded-full bg-pink-500/10 flex items-center justify-center text-pink-400 mb-2 border border-pink-500/20"><i class="fa-solid fa-users"></i></div>
-          <p class="text-[9px] text-slate-400 uppercase font-bold tracking-widest mb-1">Referrals</p>
-          <p id="profile-refs" class="text-sm font-black text-white">0</p>
+        <div class="glass-card p-5 rounded-2xl border-t-2 border-t-amber-500/40 shadow-lg flex flex-col items-center justify-center text-center">
+            <div class="w-10 h-10 rounded-full bg-amber-500/10 flex items-center justify-center mb-2">
+                <i class="fa-solid fa-list-check text-amber-400 text-lg"></i>
+            </div>
+            <p class="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Tasks Completed</p>
+            <p id="profile-stat-tasks" class="text-xl font-black text-white">0</p>
         </div>
-      </div>
-
-      <!-- Action Buttons -->
-      <div class="space-y-3 pt-2">
-        <button onclick="openReferralsView()" class="w-full premium-glass border border-white/10 py-4 rounded-xl text-white font-black text-xs uppercase tracking-widest flex items-center justify-between px-5 active:scale-95 transition-transform">
-          <span class="flex items-center gap-3"><i class="fa-solid fa-user-plus text-pink-400 text-lg"></i> My Referrals</span>
-          <i class="fa-solid fa-chevron-right text-slate-500 text-[10px]"></i>
-        </button>
-      </div>
-    </div>
-
-    <!-- REFERRALS SUB-VIEW (Not in Bottom Nav) -->
-    <div id="view-referrals" class="view-section hidden fade-in space-y-6 pb-4">
-      <div class="flex items-center gap-3 pt-2 pb-1">
-        <button onclick="switchTab('profile')" class="w-10 h-10 rounded-xl premium-glass border border-white/10 flex items-center justify-center text-slate-400 active:scale-90 transition-transform">
-          <i class="fa-solid fa-arrow-left"></i>
-        </button>
-        <div>
-          <h2 class="text-2xl font-black text-white tracking-tight">Referrals</h2>
-          <p class="text-[10px] text-pink-400 uppercase tracking-widest font-bold">Invite & Earn</p>
-        </div>
-        <button onclick="toggleRefInfo()" class="ml-auto w-10 h-10 rounded-xl bg-blue-500/10 border border-blue-500/30 flex items-center justify-center text-blue-400 active:scale-90 transition-transform">
-          <i class="fa-solid fa-info text-sm"></i>
-        </button>
-      </div>
-
-      <div class="grid grid-cols-3 gap-2">
-        <div class="premium-glass p-4 rounded-2xl text-center border-t border-white/10">
-          <p class="text-[9px] text-slate-400 uppercase font-black tracking-widest mb-1">Total</p>
-          <p id="ref-total" class="text-xl font-black text-white">0</p>
-        </div>
-        <div class="premium-glass p-4 rounded-2xl text-center border-t border-amber-500/30 bg-amber-500/5">
-          <p class="text-[9px] text-slate-400 uppercase font-black tracking-widest mb-1">Pending</p>
-          <p id="ref-pending" class="text-xl font-black text-amber-400">0</p>
-        </div>
-        <div class="premium-glass p-4 rounded-2xl text-center border-t border-emerald-500/30 bg-emerald-500/5">
-          <p class="text-[9px] text-slate-400 uppercase font-black tracking-widest mb-1">Approved</p>
-          <p id="ref-approved" class="text-xl font-black text-emerald-400">0</p>
-        </div>
-      </div>
-
-      <div class="premium-glass rounded-[1.5rem] p-5 space-y-4 border-white/5">
-        <div>
-          <label class="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 ml-1">Your Referral Link</label>
-          <div class="flex items-center gap-2">
-            <input type="text" id="ref-link-input" readonly class="flex-1 bg-black/40 border border-white/10 rounded-xl py-3.5 px-4 text-xs font-medium text-slate-300 focus:outline-none">
-            <button onclick="copyRefLink()" class="bg-black/60 text-white w-12 h-12 rounded-xl flex items-center justify-center active:scale-95 transition-transform border border-white/10 hover:bg-white/5">
-              <i class="fa-regular fa-copy"></i>
-            </button>
-          </div>
-        </div>
-        <button onclick="shareReferralTelegram()" class="w-full py-4 bg-gradient-to-r from-blue-600 to-blue-400 text-white font-black rounded-xl text-sm uppercase tracking-widest flex items-center justify-center gap-2 shadow-[0_5px_15px_rgba(59,130,246,0.3)] active:scale-95 transition-transform border border-blue-300/30">
-          <i class="fa-brands fa-telegram text-lg"></i> Share on Telegram
-        </button>
-      </div>
-
-      <div>
-        <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] pl-2 mb-3"><i class="fa-solid fa-users text-slate-600 mr-1"></i> Your Network</h3>
-        <div id="referral-list-container" class="space-y-3"></div>
-      </div>
-
-      <div class="mt-6 border-t border-white/5 pt-6">
-        <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] pl-2 mb-3"><i class="fa-solid fa-gift text-slate-600 mr-1"></i> Reward History</h3>
-        <div id="referral-rewards-container" class="space-y-3"></div>
       </div>
     </div>
 
   </main>
 
-  <!-- BOTTOM NAVIGATION (Strict Order: Home, Tasks, Box, Wallet, Profile) -->
-  <nav id="bottom-nav" class="fixed bottom-6 left-1/2 -translate-x-1/2 w-[calc(100%-2rem)] max-w-[400px] premium-glass rounded-2xl z-50 shadow-[0_20px_40px_rgba(0,0,0,0.8)] border border-white/10" style="padding-bottom: max(0.5rem, var(--safe-area-bottom));">
-    <div class="flex justify-between items-center px-1 py-1.5 relative">
-      <button onclick="switchTab('home')" class="nav-btn nav-active text-slate-500 flex flex-col items-center gap-1 flex-1 py-2 transition-all duration-300 relative group" data-target="home">
-        <i class="fa-solid fa-house text-lg transition-transform duration-300 group-active:scale-90"></i>
-        <span class="text-[8px] font-black uppercase tracking-widest opacity-70 transition-opacity">Home</span>
+  <!-- BOTTOM NAVIGATION (Fixed order as requested, Safe Area Supported) -->
+  <nav id="bottom-nav" class="fixed bottom-4 left-1/2 -translate-x-1/2 w-[calc(100%-1rem)] max-w-[420px] glass-card rounded-2xl pb-safe z-50 shadow-[0_20px_40px_rgba(0,0,0,0.8)] border border-slate-700/50 backdrop-blur-xl transition-transform duration-300">
+    <div class="flex justify-between items-center px-1 py-2.5 relative">
+      <button onclick="switchTab('home')" class="nav-btn nav-active text-slate-500 flex flex-col items-center gap-1 flex-1 transition-all duration-300 relative group" data-target="home">
+        <i class="fa-solid fa-house text-lg transition-transform group-active:scale-90"></i>
+        <span class="text-[8px] font-black uppercase tracking-widest mt-0.5">Home</span>
       </button>
-      <button onclick="switchTab('tasks')" class="nav-btn text-slate-500 flex flex-col items-center gap-1 flex-1 py-2 transition-all duration-300 relative group" data-target="tasks">
-        <i class="fa-solid fa-list-check text-lg transition-transform duration-300 group-active:scale-90"></i>
-        <span class="text-[8px] font-black uppercase tracking-widest opacity-70 transition-opacity">Tasks</span>
+      <button onclick="switchTab('tasks')" class="nav-btn text-slate-500 flex flex-col items-center gap-1 flex-1 transition-all duration-300 relative group" data-target="tasks">
+        <i class="fa-solid fa-list-check text-lg transition-transform group-active:scale-90"></i>
+        <span class="text-[8px] font-black uppercase tracking-widest mt-0.5">Tasks</span>
       </button>
-      <button onclick="switchTab('boxes')" class="nav-btn text-slate-500 flex flex-col items-center gap-1 flex-1 py-2 transition-all duration-300 relative group" data-target="boxes">
-        <i class="fa-solid fa-box-open text-lg transition-transform duration-300 group-active:scale-90"></i>
-        <span class="text-[8px] font-black uppercase tracking-widest opacity-70 transition-opacity">Box</span>
+      <button onclick="switchTab('referrals')" class="nav-btn text-slate-500 flex flex-col items-center gap-1 flex-1 transition-all duration-300 relative group" data-target="referrals">
+        <i class="fa-solid fa-users text-lg transition-transform group-active:scale-90"></i>
+        <span class="text-[8px] font-black uppercase tracking-widest mt-0.5">Referans</span>
       </button>
-      <button onclick="switchTab('withdraw')" class="nav-btn text-slate-500 flex flex-col items-center gap-1 flex-1 py-2 transition-all duration-300 relative group" data-target="withdraw">
-        <i class="fa-solid fa-wallet text-lg transition-transform duration-300 group-active:scale-90"></i>
-        <span class="text-[8px] font-black uppercase tracking-widest opacity-70 transition-opacity">Wallet</span>
+      <button onclick="switchTab('boxes')" class="nav-btn text-slate-500 flex flex-col items-center gap-1 flex-1 transition-all duration-300 relative group" data-target="boxes">
+        <i class="fa-solid fa-box-open text-lg transition-transform group-active:scale-90"></i>
+        <span class="text-[8px] font-black uppercase tracking-widest mt-0.5">Box</span>
       </button>
-      <button onclick="switchTab('profile')" class="nav-btn text-slate-500 flex flex-col items-center gap-1 flex-1 py-2 transition-all duration-300 relative group" data-target="profile">
-        <i class="fa-solid fa-user text-lg transition-transform duration-300 group-active:scale-90"></i>
-        <span class="text-[8px] font-black uppercase tracking-widest opacity-70 transition-opacity">Profile</span>
+      <button onclick="switchTab('wallet')" class="nav-btn text-slate-500 flex flex-col items-center gap-1 flex-1 transition-all duration-300 relative group" data-target="wallet">
+        <i class="fa-solid fa-wallet text-lg transition-transform group-active:scale-90"></i>
+        <span class="text-[8px] font-black uppercase tracking-widest mt-0.5">Wallet</span>
+      </button>
+      <button onclick="switchTab('profile')" class="nav-btn text-slate-500 flex flex-col items-center gap-1 flex-1 transition-all duration-300 relative group" data-target="profile">
+        <i class="fa-solid fa-user text-lg transition-transform group-active:scale-90"></i>
+        <span class="text-[8px] font-black uppercase tracking-widest mt-0.5">Profile</span>
       </button>
     </div>
   </nav>
 
   <!-- Referral Information Modal -->
   <div id="ref-info-modal" class="fixed inset-0 modal-overlay hidden flex-col items-center justify-center p-4 transition-opacity fade-in">
-    <div class="premium-glass w-full max-w-sm rounded-[2rem] p-6 relative border border-blue-500/30 shadow-[0_0_40px_rgba(0,0,0,0.8)]">
-      <button onclick="toggleRefInfo()" class="absolute top-4 right-4 w-8 h-8 rounded-full bg-black/50 text-slate-400 flex items-center justify-center hover:text-white active:scale-90 transition-transform border border-white/10">
-        <i class="fa-solid fa-xmark"></i>
+    <div class="glass-card w-full max-w-sm rounded-[2rem] p-6 relative border border-blue-500/30 shadow-[0_0_50px_rgba(0,0,0,0.9)]">
+      <button onclick="toggleRefInfo()" class="absolute top-4 right-4 w-9 h-9 rounded-full bg-slate-800 text-slate-400 flex items-center justify-center hover:text-white active:scale-90 transition-transform border border-slate-700 shadow-md">
+        <i class="fa-solid fa-xmark text-lg"></i>
       </button>
       
-      <div class="w-14 h-14 mx-auto bg-blue-500/10 rounded-full flex items-center justify-center mb-4 border border-blue-500/30 text-blue-400 text-2xl shadow-[0_0_20px_rgba(59,130,246,0.2)]">
+      <div class="w-16 h-16 mx-auto bg-blue-500/10 rounded-full flex items-center justify-center mb-5 border border-blue-500/30 text-blue-400 text-3xl shadow-[0_0_25px_rgba(59,130,246,0.25)]">
         <i class="fa-solid fa-users"></i>
       </div>
       
-      <h3 class="text-xl font-black text-white text-center mb-2 tracking-wide">Referral Rules</h3>
-      <p class="text-xs text-slate-400 text-center mb-6 leading-relaxed">Invite your friends and earn rewards! A referral becomes <span class="text-emerald-400 font-bold">Approved</span> only when they complete the following requirements.</p>
+      <h3 class="text-2xl font-black text-white text-center mb-2 tracking-wide">Referral Rules</h3>
+      <p class="text-[13px] text-slate-400 text-center mb-6 leading-relaxed px-2">Invite friends and earn rewards! A referral becomes <span class="text-emerald-400 font-bold">Approved</span> only when they complete these requirements.</p>
       
-      <ul class="space-y-3 mb-6">
-        <li class="flex items-start gap-3 bg-black/40 p-3 rounded-xl border border-white/5">
-          <i class="fa-solid fa-play text-blue-400 mt-1"></i>
+      <ul class="space-y-4 mb-6">
+        <li class="flex items-start gap-3 bg-[#050511]/60 p-3.5 rounded-xl border border-slate-700/80 shadow-inner">
+          <i class="fa-solid fa-play text-blue-400 mt-1 drop-shadow-[0_0_5px_#3b82f6] text-lg"></i>
           <div>
             <p class="text-sm font-black text-white">Watch 25 Ads</p>
-            <p class="text-[10px] text-slate-500 mt-0.5">The user must watch a total of 25 ads.</p>
+            <p class="text-[11px] text-slate-500 mt-0.5">They must watch a total of 25 ads.</p>
           </div>
         </li>
-        <li class="flex items-start gap-3 bg-black/40 p-3 rounded-xl border border-white/5">
-          <i class="fa-solid fa-list-check text-crypto-glow mt-1"></i>
+        <li class="flex items-start gap-3 bg-[#050511]/60 p-3.5 rounded-xl border border-slate-700/80 shadow-inner">
+          <i class="fa-solid fa-list-check text-crypto-glow mt-1 drop-shadow-[0_0_5px_#00f0ff] text-lg"></i>
           <div>
             <p class="text-sm font-black text-white">Complete 5 Tasks</p>
-            <p class="text-[10px] text-slate-500 mt-0.5">The user must complete at least 5 standard missions.</p>
-          </div>
-        </li>
-        <li class="flex items-start gap-3 bg-black/40 p-3 rounded-xl border border-white/5">
-          <i class="fa-solid fa-clock text-amber-400 mt-1"></i>
-          <div>
-            <p class="text-sm font-black text-white">No Deadline</p>
-            <p class="text-[10px] text-slate-500 mt-0.5">The referral remains pending until all requirements are met.</p>
+            <p class="text-[11px] text-slate-500 mt-0.5">They must complete at least 5 daily missions.</p>
           </div>
         </li>
       </ul>
 
-      <div class="bg-emerald-500/10 border border-emerald-500/30 p-3 rounded-xl text-center">
-        <p class="text-[10px] text-emerald-400 font-bold uppercase tracking-widest mb-1">Approval Reward</p>
-        <p class="text-lg font-black text-white">+250 XP & $0.025</p>
+      <div class="bg-gradient-to-r from-emerald-900/40 to-teal-900/40 border border-emerald-500/40 p-4 rounded-xl text-center shadow-[0_0_15px_rgba(16,185,129,0.15)]">
+        <p class="text-[11px] text-emerald-400 font-bold uppercase tracking-widest mb-1">Approval Reward</p>
+        <p class="text-xl font-black text-white">+250 XP & $0.025</p>
       </div>
     </div>
   </div>
@@ -946,12 +909,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     const tg = window.Telegram.WebApp;
     tg.expand(); 
     tg.ready();
-    tg.setHeaderColor('#0a0a16');
-    tg.setBackgroundColor('#030308');
+    tg.setHeaderColor('#0a0b1a');
+    tg.setBackgroundColor('#050511');
 
-    // Extract TG User Data safely
+    // Extract TG User Data comprehensively
     const tgUser = tg.initDataUnsafe?.user || {
-      id: Math.floor(Math.random() * 10000000), 
+      id: Math.floor(Math.random() * 10000000), // Fallback for local testing
       first_name: "Demo",
       last_name: "User",
       username: "demouser",
@@ -968,8 +931,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       tasks: []
     };
 
-    // Helper: format numbers precisely to drop trailing zeroes (e.g. 10.00 -> 10, 10.50 -> 10.5)
-    const fmtNum = (num) => parseFloat(Number(num).toFixed(4)).toString();
+    // Number formatter to remove unnecessary decimals
+    function formatNum(num, isMoney = false) {
+        if (!num) return isMoney ? "0" : "0";
+        let val = Number(num);
+        if (isMoney) {
+            return val % 1 === 0 ? val.toString() : val.toFixed(2).replace(/\.?0+$/, '');
+        }
+        return val.toLocaleString();
+    }
 
     // Central API Caller
     async function apiCall(action, payload = {}) {
@@ -977,7 +947,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         const body = {
           action: action,
           tgId: tgUser.id,
-          firstName: tgUser.first_name,
+          firstName: tgUser.first_name || '',
           lastName: tgUser.last_name || '',
           username: tgUser.username || '',
           photoUrl: tgUser.photo_url || '',
@@ -1020,23 +990,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       document.getElementById('toast-title').innerText = title;
       document.getElementById('toast-message').innerText = message;
       
-      let iconClass, iconHtml;
+      let iconClass, iconHtml, borderStyle;
       if (type === 'success') {
         iconHtml = '<i class="fa-solid fa-check"></i>';
-        iconClass = 'bg-emerald-500/20 text-emerald-400 border-emerald-500/50 shadow-[0_0_20px_rgba(16,185,129,0.3)]';
+        iconClass = 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/50 shadow-[0_0_15px_rgba(16,185,129,0.3)]';
+        borderStyle = '1px solid rgba(16, 185, 129, 0.4)';
       } else if (type === 'error') {
         iconHtml = '<i class="fa-solid fa-xmark"></i>';
-        iconClass = 'bg-red-500/20 text-red-400 border-red-500/50 shadow-[0_0_20px_rgba(239,68,68,0.3)]';
+        iconClass = 'bg-red-500/20 text-red-400 border border-red-500/50 shadow-[0_0_15px_rgba(239,68,68,0.3)]';
+        borderStyle = '1px solid rgba(239, 68, 68, 0.4)';
       } else if (type === 'jackpot') {
-        iconHtml = '<i class="fa-solid fa-sack-dollar animate-bounce"></i>';
-        iconClass = 'bg-amber-500/20 text-amber-400 border-amber-500/50 shadow-[0_0_30px_rgba(251,191,36,0.6)]';
+        iconHtml = '<i class="fa-solid fa-sack-dollar animate-bounce text-2xl"></i>';
+        iconClass = 'bg-amber-500/20 text-amber-400 border border-amber-500/50 shadow-[0_0_25px_rgba(251,191,36,0.7)]';
+        borderStyle = '1px solid rgba(251, 191, 36, 0.8)';
       } else {
         iconHtml = '<i class="fa-solid fa-bell animate-pulse"></i>';
-        iconClass = 'bg-blue-500/20 text-crypto-glow border-crypto-glow/50 shadow-[0_0_20px_rgba(0,229,255,0.3)]';
+        iconClass = 'bg-blue-500/20 text-crypto-glow border border-crypto-glow/50 shadow-[0_0_15px_rgba(0,240,255,0.3)]';
+        borderStyle = '1px solid rgba(0, 240, 255, 0.4)';
       }
 
       icon.innerHTML = iconHtml;
-      icon.className = `w-12 h-12 rounded-2xl flex shrink-0 items-center justify-center text-xl border ${iconClass}`;
+      icon.className = `w-12 h-12 rounded-xl flex shrink-0 items-center justify-center text-xl ${iconClass}`;
+      toast.style.border = borderStyle;
 
       toast.classList.add('toast-show');
       
@@ -1049,74 +1024,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       setTimeout(() => { toast.classList.remove('toast-show'); }, type === 'jackpot' ? 5000 : 3000); 
     }
 
-    function getFallbackAvatar(name) {
-      const initial = name ? name.charAt(0).toUpperCase() : 'U';
-      const canvas = document.createElement('canvas');
-      canvas.width = 150; canvas.height = 150;
-      const ctx = canvas.getContext('2d');
-      const grad = ctx.createLinearGradient(0, 0, 150, 150);
-      grad.addColorStop(0, '#7c3aed');
-      grad.addColorStop(1, '#3b82f6');
-      ctx.fillStyle = grad;
-      ctx.fillRect(0, 0, 150, 150);
-      ctx.fillStyle = '#ffffff';
-      ctx.font = 'bold 70px Outfit, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(initial, 75, 75);
-      return canvas.toDataURL();
-    }
-
     function updateUI() {
       const u = appState.user;
       
-      const fullName = trimString(`${u.firstName} ${u.lastName}`);
-      const avatarSrc = u.photoUrl ? u.photoUrl : getFallbackAvatar(fullName);
+      // Global Header Data
+      const fullName = [u.firstName, u.lastName].filter(Boolean).join(' ') || 'User';
+      document.getElementById('user-name').innerText = fullName;
+      document.getElementById('user-xp').innerHTML = `${formatNum(u.xp)} <span class="text-[10px] text-crypto-glow font-bold">XP</span>`;
+      document.getElementById('user-usd').innerText = formatNum(u.usd, true);
       
-      // Header
-      document.getElementById('header-name').innerText = u.firstName;
-      document.getElementById('header-xp').innerText = u.xp.toLocaleString();
-      document.getElementById('header-photo').src = avatarSrc;
+      const avatarFallback = `https://ui-avatars.com/api/?name=${encodeURIComponent(fullName)}&background=0a0b1a&color=00f0ff&bold=true`;
+      const avatarUrl = u.photoUrl || avatarFallback;
+      document.getElementById('user-photo').src = avatarUrl;
+      document.getElementById('profile-page-avatar').src = avatarUrl;
 
-      // Profile Page 
-      const xpThresholds = [0, 250, 750, 1500, 3000, 20000];
-      let nextTarget = 20000;
-      let prevTarget = 0;
-      for (let i = 0; i < xpThresholds.length; i++) {
-          if (u.totalXp < xpThresholds[i]) {
-              nextTarget = xpThresholds[i];
-              prevTarget = xpThresholds[i-1] || 0;
-              break;
-          }
+      // Profile Page Data
+      document.getElementById('profile-page-name').innerText = fullName;
+      if (u.username) {
+          document.getElementById('profile-page-username').innerText = `@${u.username}`;
+          document.getElementById('profile-page-username').style.display = 'inline-block';
+      } else {
+          document.getElementById('profile-page-username').style.display = 'none';
       }
-      if (u.totalXp >= 20000) { nextTarget = 20000; prevTarget = 20000; }
-      
-      let progressPercent = 100;
-      if (nextTarget > prevTarget) {
-          progressPercent = ((u.totalXp - prevTarget) / (nextTarget - prevTarget)) * 100;
-      }
-      
-      document.getElementById('profile-full-name').innerText = fullName;
-      document.getElementById('profile-username').innerText = u.username ? `@${u.username}` : 'No username';
-      document.getElementById('profile-id').innerText = u.tgId;
-      document.getElementById('profile-level').innerText = u.level;
-      document.getElementById('profile-current-xp').innerText = u.totalXp.toLocaleString();
-      document.getElementById('profile-next-xp').innerText = nextTarget.toLocaleString();
-      document.getElementById('profile-percent').innerText = `${Math.min(100, Math.max(0, progressPercent)).toFixed(1)}%`;
-      document.getElementById('profile-progress-bar').style.width = `${Math.min(100, Math.max(0, progressPercent))}%`;
-      document.getElementById('profile-total-xp').innerText = `${u.totalXp.toLocaleString()} XP`;
-      document.getElementById('profile-tasks').innerText = u.tasksCompleted;
-      document.getElementById('profile-boxes').innerText = u.boxesOpened;
-      document.getElementById('profile-refs').innerText = appState.referrals.length;
-      document.getElementById('profile-photo').src = avatarSrc;
+      document.getElementById('profile-page-id').innerText = u.tgId;
+      document.getElementById('profile-stat-xp').innerText = formatNum(u.totalXp);
+      document.getElementById('profile-stat-usd').innerText = `$${formatNum(u.usd, true)}`;
+      document.getElementById('profile-stat-refs').innerText = appState.referrals.length;
+      document.getElementById('profile-stat-tasks').innerText = u.tasksCompleted;
 
-      // Home Page
-      document.getElementById('home-xp-display').innerText = `${u.xp.toLocaleString()} XP`;
-      document.getElementById('home-usd-display').innerText = fmtNum(u.usd);
-      document.getElementById('home-ads-watched').innerText = u.adsWatchedToday;
-      document.getElementById('home-streak').innerText = u.streak;
+      // Home Page Data
+      document.getElementById('main-xp-display').innerText = `${formatNum(u.xp)} XP`;
+      document.getElementById('ads-watched').innerText = u.adsWatchedToday;
+      document.getElementById('streak-days').innerText = u.streak;
 
-      // Referrals Page
+      // Referrals Page Data
       const pending = appState.referrals.filter(r => r.status === 'Pending').length;
       const approved = appState.referrals.filter(r => r.status === 'Approved').length;
       document.getElementById('ref-total').innerText = appState.referrals.length;
@@ -1127,66 +1068,58 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       renderReferrals();
       renderRewardHistory();
 
-      // Wallet / Withdraw Page
-      document.getElementById('wallet-balance').innerText = fmtNum(u.usd);
+      // Wallet Page Data
+      document.getElementById('withdraw-balance-display').innerText = formatNum(u.usd, true);
       renderWithdrawHistory();
 
-      // Tasks
-      renderDailyLogin();
+      // Tasks Data
+      renderDailyLoginTask();
       renderMissions();
     }
 
-    function trimString(str) {
-      return str.trim() || 'User';
-    }
-
-    function renderDailyLogin() {
-      const container = document.getElementById('daily-login-container');
+    function renderDailyLoginTask() {
+      const container = document.getElementById('streak-tracker-container');
+      const btnContainer = document.getElementById('daily-login-btn-container');
       container.innerHTML = '';
-      const rewards = [5, 10, 15, 20, 25, 30, 50];
-      const streak = appState.user.streak || 1;
-      const claimedToday = appState.tasks.includes('streakLogin');
       
+      const rewards = [10, 20, 30, 40, 50, 75, 100];
+      const streak = appState.user.streak || 1;
+      const claimedToday = appState.tasks.includes('dailyLogin');
+      
+      // Render Tracker
       for (let i = 1; i <= 7; i++) {
         const isPast = i < streak || (i === streak && claimedToday);
         const isToday = i === streak && !claimedToday;
         
-        let styles = "bg-black/50 border-white/5 text-slate-500";
+        let styles = "bg-[#050511] border-slate-700/50 text-slate-600";
         let icon = `<span class="text-[10px] font-black">${rewards[i-1]}</span>`;
-        let lineStyle = "bg-white/5";
+        let lineStyle = "bg-slate-800";
         
         if (isPast) {
-          styles = "bg-emerald-500/10 border-emerald-500/30 text-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.2)]";
-          icon = `<i class="fa-solid fa-check text-xs"></i>`;
-          lineStyle = "bg-emerald-500/30";
+          styles = "bg-emerald-500/20 border-emerald-500/50 text-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.3)]";
+          icon = `<i class="fa-solid fa-check text-sm"></i>`;
+          lineStyle = "bg-emerald-500/50 shadow-[0_0_5px_#34d399]";
         } else if (isToday) {
-          styles = "bg-crypto-glow/10 border-crypto-glow shadow-[0_0_20px_rgba(0,229,255,0.4)] text-white cursor-pointer hover:scale-110";
+          styles = "bg-blue-600/30 border-crypto-glow shadow-[0_0_20px_rgba(0,240,255,0.5)] text-white";
         }
 
-        const onClick = isToday ? `onclick="claimTask('streakLogin', ${rewards[i-1]})"` : '';
-        const claimAnim = isToday ? 'animate-pulse' : '';
-
         container.innerHTML += `
-          <div class="relative flex flex-col items-center gap-2 z-10 flex-1">
-            <div ${onClick} class="w-10 h-10 rounded-xl border-2 flex items-center justify-center transition-all duration-300 ${styles} z-10 relative premium-glass ${claimAnim}">
+          <div class="relative flex flex-col items-center gap-1.5 z-10 flex-1">
+            <div class="w-10 h-10 rounded-xl border-2 flex items-center justify-center transition-all duration-300 ${styles} z-10 relative bg-[#0a0b1a]">
               ${icon}
             </div>
-            <span class="text-[8px] font-black tracking-widest ${isToday ? 'text-crypto-glow drop-shadow-[0_0_5px_rgba(0,229,255,0.8)]' : 'text-slate-500'}">DAY ${i}</span>
+            <span class="text-[9px] font-black tracking-widest ${isToday ? 'text-crypto-glow drop-shadow-[0_0_5px_#00f0ff]' : 'text-slate-500'}">DAY ${i}</span>
             ${i < 7 ? `<div class="absolute top-5 left-[50%] w-full h-1 -z-0 ${lineStyle} rounded-full"></div>` : ''}
           </div>
         `;
       }
       
-      // If today is claimable, add a large claim button underneath
-      if (!claimedToday) {
-         const currentReward = rewards[streak - 1];
-         container.innerHTML += `
-            <div class="absolute inset-0 bg-black/60 backdrop-blur-[2px] flex items-center justify-center z-20 rounded-xl rounded-t-none top-1/2">
-               <button onclick="claimTask('streakLogin', ${currentReward})" class="bg-gradient-to-r from-crypto-glow to-blue-500 text-black font-black uppercase text-xs px-6 py-2 rounded-xl shadow-[0_0_20px_rgba(0,229,255,0.4)] active:scale-95 transition-transform flex items-center gap-2">
-                 Claim Day ${streak} Reward <i class="fa-solid fa-bolt"></i>
-               </button>
-            </div>
-         `;
+      // Render Button
+      if (claimedToday) {
+          btnContainer.innerHTML = `<button class="bg-emerald-900/50 border border-emerald-500/40 text-emerald-400 px-5 py-2.5 rounded-xl text-xs font-black uppercase tracking-wider flex items-center gap-2 cursor-not-allowed opacity-80 shadow-inner"><i class="fa-solid fa-check-double"></i> Claimed</button>`;
+      } else {
+          const rewardAmount = rewards[streak - 1];
+          btnContainer.innerHTML = `<button onclick="claimTask('dailyLogin', ${rewardAmount})" class="bg-gradient-to-r from-crypto-glow to-blue-500 text-crypto-dark shadow-[0_5px_20px_rgba(0,240,255,0.5)] hover:brightness-110 active:scale-95 transition-all px-6 py-2.5 rounded-xl text-xs font-black uppercase tracking-widest animate-pulse-fast">CLAIM</button>`;
       }
     }
 
@@ -1194,18 +1127,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       const container = document.getElementById('missions-container');
       container.innerHTML = '';
       
-      // Only Keep non-duplicate tasks (Removed mission_login, mission_share)
       const missionsList = [
         { id: 'watch5', label: 'Watch 5 Ads', icon: 'fa-video', color: 'text-blue-400', bg: 'bg-blue-500/10 border-blue-500/20', reward: 20, target: 5, current: appState.user.adsWatchedToday },
-        { id: 'watch30', label: 'Watch 30 Ads', icon: 'fa-clapperboard', color: 'text-purple-400', bg: 'bg-purple-500/10 border-purple-500/20', reward: 50, target: 30, current: appState.user.adsWatchedToday }
+        { id: 'watch15', label: 'Watch 15 Ads', icon: 'fa-film', color: 'text-indigo-400', bg: 'bg-indigo-500/10 border-indigo-500/20', reward: 40, target: 15, current: appState.user.adsWatchedToday },
+        { id: 'watch30', label: 'Watch 30 Ads', icon: 'fa-clapperboard', color: 'text-purple-400', bg: 'bg-purple-500/10 border-purple-500/20', reward: 80, target: 30, current: appState.user.adsWatchedToday }
       ];
-      
-      let allCompleted = true;
-      missionsList.forEach(m => {
-          if (!appState.tasks.includes(m.id)) allCompleted = false;
-      });
-
-      missionsList.push({ id: 'mission_all', label: 'Complete All Tasks', icon: 'fa-trophy', color: 'text-amber-400', bg: 'bg-amber-500/10 border-amber-500/20', reward: 100, target: 1, current: allCompleted ? 1 : 0 });
 
       missionsList.forEach(m => {
         const claimed = appState.tasks.includes(m.id);
@@ -1213,75 +1139,41 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         
         let btnHtml = '';
         if (claimed) {
-            btnHtml = `<span class="text-[10px] font-black bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-lg border border-emerald-500/30 flex items-center gap-1 shadow-inner"><i class="fa-solid fa-check-double"></i> Claimed</span>`;
+            btnHtml = `<span class="text-[10px] font-black bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-xl border border-emerald-500/30 flex items-center gap-1 shadow-inner"><i class="fa-solid fa-check-double"></i> Claimed</span>`;
         } else if (canClaim) {
-            btnHtml = `<button onclick="claimTask('${m.id}', ${m.reward})" class="text-[10px] font-black bg-gradient-to-r from-blue-500 to-crypto-glow text-black px-4 py-1.5 rounded-lg shadow-[0_0_15px_rgba(0,229,255,0.4)] active:scale-95 transition-all uppercase tracking-wider">Claim</button>`;
+            btnHtml = `<button onclick="claimTask('${m.id}', ${m.reward})" class="text-[11px] font-black bg-gradient-to-r from-blue-600 to-cyan-500 text-white px-4 py-1.5 rounded-xl shadow-[0_4px_15px_rgba(0,240,255,0.4)] active:scale-95 transition-all uppercase tracking-wider">Claim</button>`;
         } else {
-            btnHtml = `<span class="text-[10px] font-black bg-white/5 text-slate-300 px-3 py-1.5 rounded-lg border border-white/10 shadow-inner">+${m.reward} XP</span>`;
+            btnHtml = `<span class="text-[11px] font-black bg-slate-800/60 text-slate-300 px-3 py-1.5 rounded-xl border border-slate-700 shadow-inner">+${m.reward} XP</span>`;
         }
 
         container.innerHTML += `
-          <div class="premium-glass rounded-2xl p-3 flex justify-between items-center transition-transform hover:-translate-y-0.5 border border-white/5">
-            <div class="flex items-center gap-3">
-              <div class="w-11 h-11 rounded-xl border ${m.bg} flex items-center justify-center shadow-inner">
-                 <i class="fa-solid ${m.icon} ${m.color} text-lg"></i>
+          <div class="glass-card rounded-2xl p-4 flex justify-between items-center transition-transform hover:-translate-y-0.5 border border-slate-800/80 shadow-md">
+            <div class="flex items-center gap-3.5">
+              <div class="w-12 h-12 rounded-xl border ${m.bg} flex items-center justify-center shadow-inner">
+                 <i class="fa-solid ${m.icon} ${m.color} text-xl drop-shadow-md"></i>
               </div>
               <div class="flex flex-col">
-                <span class="text-xs font-black text-white tracking-wide">${m.label}</span>
-                <span class="text-crypto-glow text-[10px] font-bold tracking-widest uppercase opacity-80 mt-0.5">(${Math.min(m.current, m.target)}/${m.target})</span>
+                <span class="text-sm font-black text-white tracking-wide">${m.label}</span>
+                <span class="text-crypto-glow text-[10px] font-bold tracking-widest uppercase opacity-80 mt-0.5">Progress: ${Math.min(m.current, m.target)}/${m.target}</span>
               </div>
             </div>
             ${btnHtml}
           </div>
         `;
       });
-      
-      // Render AZX Sponsored Task
-      const azxContainer = document.getElementById('azx-task-container');
-      if (azxContainer) {
-          const azxClaimed = appState.user.azxCryptoTaskCompleted;
-          let azxBtn = azxClaimed
-              ? `<span class="text-[10px] font-black bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-lg border border-emerald-500/30 flex items-center gap-1 shadow-inner"><i class="fa-solid fa-check-double"></i> Done</span>`
-              : `<button onclick="claimAZXTask()" class="text-[10px] font-black bg-gradient-to-r from-blue-600 to-blue-400 text-white px-4 py-1.5 rounded-lg shadow-[0_0_15px_rgba(59,130,246,0.4)] active:scale-95 transition-all uppercase tracking-wider border border-blue-400/30">Join</button>`;
-
-          azxContainer.innerHTML = `
-            <div class="premium-glass rounded-2xl p-3 flex justify-between items-center transition-transform hover:-translate-y-0.5 border border-white/5">
-              <div class="flex items-center gap-3">
-                <div class="w-11 h-11 rounded-xl border bg-[#0088cc]/10 border-[#0088cc]/30 flex items-center justify-center shadow-inner">
-                   <i class="fa-brands fa-telegram text-[#0088cc] text-2xl"></i>
-                </div>
-                <div class="flex flex-col">
-                  <span class="text-xs font-black text-white tracking-wide">Join AZX Crypto</span>
-                  <span class="text-crypto-glow text-[10px] font-bold tracking-widest uppercase opacity-80 mt-0.5">+200 XP</span>
-                </div>
-              </div>
-              ${azxBtn}
-            </div>
-          `;
-      }
     }
 
     async function claimTask(taskId, reward) {
         if(tg.HapticFeedback) tg.HapticFeedback.impactOccurred('medium');
         const res = await apiCall('claim_task', { taskId, reward });
-        if(res && !res.error) showToast('Task Completed!', `You earned ${reward} XP!`, 'success');
-    }
-    
-    async function claimAZXTask() {
-        if(tg.HapticFeedback) tg.HapticFeedback.impactOccurred('medium');
-        tg.openTelegramLink('https://t.me/azxcrypto');
-        
-        setTimeout(async () => {
-            const res = await apiCall('claim_azx');
-            if(res && !res.error) showToast('Task Completed!', `You earned 200 XP!`, 'success');
-        }, 1500);
+        if(res && !res.error) showToast('Task Completed!', `You earned +${reward} XP!`, 'success');
     }
 
     async function watchAd() {
       const btn = document.getElementById('watch-ad-btn');
       const originalHTML = btn.innerHTML;
-      btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin text-white"></i> <span class="text-white">Loading Ad...</span>`;
-      btn.classList.add('opacity-70', 'pointer-events-none');
+      btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin text-lg"></i> <span>Loading Ad...</span>`;
+      btn.classList.add('opacity-80', 'pointer-events-none');
 
       if (window.Adsgram) {
         const AdController = window.Adsgram.init({ blockId: "int-35545" });
@@ -1290,15 +1182,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           if(res && !res.error) showToast('Reward Granted!', 'You earned +20 XP.', 'success');
           
           btn.innerHTML = originalHTML;
-          btn.classList.remove('opacity-70', 'pointer-events-none');
+          btn.classList.remove('opacity-80', 'pointer-events-none');
         }).catch((e) => {
           btn.innerHTML = originalHTML;
-          btn.classList.remove('opacity-70', 'pointer-events-none');
+          btn.classList.remove('opacity-80', 'pointer-events-none');
         });
       } else {
         showToast('Error', 'Ad system is currently unavailable.', 'error');
         btn.innerHTML = originalHTML;
-        btn.classList.remove('opacity-70', 'pointer-events-none');
+        btn.classList.remove('opacity-80', 'pointer-events-none');
       }
     }
 
@@ -1308,15 +1200,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       
       if(res && !res.error) {
         if(res.jackpot) {
-            showToast('HUGE JACKPOT! 💸', `Incredible! You won $${fmtNum(res.reward)}!`, 'jackpot');
+            showToast('HUGE JACKPOT! 💸', `Incredible! You won $${res.reward.toFixed(2)} USDT!`, 'jackpot');
         } else {
-            showToast('Box Opened!', `Congratulations! You won $${fmtNum(res.reward)}!`, 'success');
+            showToast('Box Opened!', `Congratulations! You won $${res.reward.toFixed(2)} USDT!`, 'success');
         }
       }
     }
 
     async function requestWithdrawal() {
-      const address = document.getElementById('wallet-address').value.trim();
+      const address = document.getElementById('wallet-address').value;
       const amount = parseFloat(document.getElementById('withdraw-amount').value);
 
       if (!address || address.length < 10) {
@@ -1324,17 +1216,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         return;
       }
       if (isNaN(amount) || amount < 10) {
-        showToast('Invalid Amount', 'The minimum withdrawal amount is $10.', 'error');
+        showToast('Invalid Amount', 'The minimum withdrawal amount is $10 USDT.', 'error');
         return;
       }
       if (amount > appState.user.usd) {
-        showToast('Insufficient Balance', 'You do not have enough funds.', 'error');
+        showToast('Insufficient Balance', 'You do not have enough USDT available.', 'error');
         return;
       }
 
+      if(tg.HapticFeedback) tg.HapticFeedback.impactOccurred('medium');
       const res = await apiCall('withdraw', { amount, address });
       if(res && !res.error) {
-          showToast('Withdrawal Requested', `Your request for $${fmtNum(amount)} has been submitted via TON network.`, 'success');
+          showToast('Withdrawal Requested', `Your request for $${amount.toFixed(2)} USDT has been submitted.`, 'success');
           document.getElementById('wallet-address').value = '';
           document.getElementById('withdraw-amount').value = '';
       }
@@ -1346,37 +1239,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       
       if (history.length === 0) {
         container.innerHTML = `
-          <div class="premium-glass rounded-2xl p-6 text-center border-dashed border-2 border-white/10">
-            <i class="fa-solid fa-clock-rotate-left text-3xl text-slate-700 mb-2"></i>
+          <div class="glass-card rounded-2xl p-6 text-center border-dashed border-2 border-slate-700/50">
+            <i class="fa-solid fa-clock-rotate-left text-4xl text-slate-700 mb-3 drop-shadow-md"></i>
             <p class="text-xs font-bold text-slate-500 uppercase tracking-widest">History is Empty</p>
           </div>`;
         return;
       }
 
-      container.innerHTML = history.map(r => {
-          const shortAddress = r.address.length > 10 ? r.address.substring(0,6) + '...' + r.address.substring(r.address.length-4) : r.address;
-          return `
-          <div class="premium-glass rounded-2xl p-4 flex justify-between items-center border border-white/5">
+      container.innerHTML = history.map(r => `
+          <div class="glass-card rounded-2xl p-4 flex justify-between items-center border border-slate-800/80">
             <div class="flex items-center gap-3">
-              <div class="w-10 h-10 rounded-full bg-black/40 border border-white/10 flex items-center justify-center">
+              <div class="w-10 h-10 rounded-full bg-[#050511] border border-slate-700 flex items-center justify-center shadow-inner">
                  <i class="fa-solid fa-arrow-right-arrow-left text-slate-400"></i>
               </div>
               <div>
-                <p class="text-xs font-black text-white">${r.id} <span class="text-[9px] text-slate-500 ml-1 font-bold">${r.date}</span></p>
-                <div class="flex gap-1 mt-0.5">
-                    <p class="text-[9px] text-blue-400 font-mono bg-blue-500/10 px-1.5 py-0.5 rounded border border-blue-500/20">${shortAddress}</p>
-                    <p class="text-[9px] text-slate-400 bg-white/5 px-1.5 py-0.5 rounded border border-white/10">${r.network || 'TON'}</p>
-                </div>
+                <p class="text-sm font-black text-white tracking-wide">${r.id} <span class="text-[10px] text-slate-500 ml-1 font-bold">${r.date}</span></p>
+                <p class="text-[10px] text-blue-400 mt-0.5 font-mono bg-blue-500/10 inline-block px-2 py-0.5 rounded-md border border-blue-500/20">${r.address}</p>
               </div>
             </div>
-            <div class="text-right flex flex-col items-end">
-              <p class="text-sm font-black text-emerald-400">-$${fmtNum(r.amount)}</p>
-              <p class="text-[9px] font-black text-amber-400 uppercase tracking-widest mt-0.5 bg-amber-500/10 px-2 py-0.5 rounded-full border border-amber-500/20">${r.status}</p>
+            <div class="text-right">
+              <p class="text-[15px] font-black text-emerald-400">-$${formatNum(r.amount, true)}</p>
+              <p class="text-[9px] font-black text-amber-400 uppercase tracking-widest mt-1 bg-amber-500/10 inline-block px-2.5 py-0.5 rounded-full border border-amber-500/20">${r.status}</p>
             </div>
           </div>
-      `}).join('');
+      `).join('');
     }
 
+    // Referrals Functions
     function copyRefLink() {
       const link = document.getElementById('ref-link-input').value;
       navigator.clipboard.writeText(link).then(() => {
@@ -1386,7 +1275,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     function shareReferralTelegram() {
       const link = `https://t.me/pointplayappbot?startapp=${appState.user.tgId}`;
-      const text = `🎯 Play games, complete tasks, earn XP, and collect exciting rewards 🚀 I’m already playing on Point Play now it’s your turn to join the adventure👇`;
+      const text = `🎯 Complete premium tasks, open boxes, and earn USDT straight to your TON Wallet! 🚀 I'm already playing Point Play, join me now 👇`;
       const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(text)}`;
       tg.openTelegramLink(shareUrl);
     }
@@ -1402,8 +1291,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       
       if (list.length === 0) {
         container.innerHTML = `
-          <div class="premium-glass rounded-2xl p-6 text-center border-dashed border-2 border-white/10">
-            <i class="fa-solid fa-user-plus text-3xl text-slate-700 mb-2"></i>
+          <div class="glass-card rounded-2xl p-6 text-center border-dashed border-2 border-slate-700/50">
+            <i class="fa-solid fa-user-plus text-4xl text-slate-700 mb-3 drop-shadow-md"></i>
             <p class="text-xs font-bold text-slate-500 uppercase tracking-widest">No referrals yet</p>
           </div>`;
         return;
@@ -1411,38 +1300,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
       container.innerHTML = list.map(r => {
         const isAppr = r.status === 'Approved';
-        const statusClass = isAppr ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' : 'bg-amber-500/10 text-amber-400 border-amber-500/30';
+        const statusClass = isAppr ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30 shadow-[0_0_10px_rgba(16,185,129,0.1)]' : 'bg-amber-500/10 text-amber-400 border-amber-500/30';
         const displayUsername = r.username ? `@${r.username}` : '';
         const initial = r.name ? r.name.charAt(0).toUpperCase() : 'U';
 
         return `
-          <div class="premium-glass rounded-2xl p-4 flex flex-col gap-3 border border-white/5">
+          <div class="glass-card rounded-[1.25rem] p-4 flex flex-col gap-3.5 border border-slate-800/80">
             <div class="flex justify-between items-center">
-              <div class="flex items-center gap-3">
-                <div class="w-10 h-10 rounded-full bg-gradient-to-br from-purple-500 to-blue-600 flex items-center justify-center font-black text-white shadow-[0_0_10px_rgba(124,58,237,0.4)]">${initial}</div>
-                <div class="flex flex-col max-w-[120px]">
-                  <span class="text-sm font-black text-white tracking-wide truncate">${r.name}</span>
-                  ${displayUsername ? `<span class="text-[10px] text-slate-400 font-mono truncate">${displayUsername}</span>` : ''}
+              <div class="flex items-center gap-3.5">
+                <div class="w-11 h-11 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center font-black text-white shadow-[0_0_15px_rgba(59,130,246,0.4)] text-lg">${initial}</div>
+                <div class="flex flex-col">
+                  <span class="text-sm font-black text-white tracking-wide truncate max-w-[120px]">${r.name}</span>
+                  ${displayUsername ? `<span class="text-[10px] text-slate-400 font-mono mt-0.5">${displayUsername}</span>` : ''}
                 </div>
               </div>
-              <span class="text-[9px] font-black uppercase tracking-widest px-2 py-1 rounded-lg border ${statusClass}">${r.status}</span>
+              <span class="text-[9px] font-black uppercase tracking-widest px-2.5 py-1 rounded-md border ${statusClass}">${r.status}</span>
             </div>
             
             ${!isAppr ? `
-            <div class="bg-black/40 rounded-xl p-3 border border-white/5 grid grid-cols-2 gap-3">
+            <div class="bg-[#050511]/60 rounded-xl p-3.5 border border-slate-700/60 grid grid-cols-2 gap-3 shadow-inner">
               <div class="text-center">
-                <p class="text-[9px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">Ads Watched</p>
-                <div class="w-full bg-white/5 rounded-full h-1.5 mb-1 overflow-hidden">
-                  <div class="bg-blue-500 h-full rounded-full shadow-[0_0_5px_#3b82f6]" style="width: ${Math.min((r.ads/25)*100, 100)}%"></div>
+                <p class="text-[9px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">Ads Progress</p>
+                <div class="w-full bg-slate-800 rounded-full h-1.5 mb-1.5 overflow-hidden shadow-inner">
+                  <div class="bg-blue-500 h-full rounded-full" style="width: ${Math.min((r.ads/25)*100, 100)}%"></div>
                 </div>
-                <p class="text-[10px] font-black text-white">${r.ads} <span class="text-slate-500">/ 25</span></p>
+                <p class="text-[11px] font-black text-white">${r.ads} <span class="text-slate-500 font-bold">/ 25</span></p>
               </div>
-              <div class="text-center">
-                <p class="text-[9px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">Tasks Done</p>
-                <div class="w-full bg-white/5 rounded-full h-1.5 mb-1 overflow-hidden">
-                  <div class="bg-crypto-glow h-full rounded-full shadow-[0_0_5px_#00e5ff]" style="width: ${Math.min((r.tasks/5)*100, 100)}%"></div>
+              <div class="text-center border-l border-slate-700">
+                <p class="text-[9px] font-bold text-slate-500 uppercase tracking-widest mb-1.5">Task Progress</p>
+                <div class="w-3/4 mx-auto bg-slate-800 rounded-full h-1.5 mb-1.5 overflow-hidden shadow-inner">
+                  <div class="bg-crypto-glow h-full rounded-full" style="width: ${Math.min((r.tasks/5)*100, 100)}%"></div>
                 </div>
-                <p class="text-[10px] font-black text-white">${r.tasks} <span class="text-slate-500">/ 5</span></p>
+                <p class="text-[11px] font-black text-white">${r.tasks} <span class="text-slate-500 font-bold">/ 5</span></p>
               </div>
             </div>` : ''}
           </div>
@@ -1456,59 +1345,48 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       
       if (rewards.length === 0) {
         container.innerHTML = `
-          <div class="premium-glass rounded-2xl p-4 text-center border-dashed border border-white/10">
+          <div class="glass-card rounded-2xl p-5 text-center border-dashed border border-slate-700/50">
             <p class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">No rewards yet</p>
           </div>`;
         return;
       }
 
       container.innerHTML = rewards.map(r => `
-        <div class="premium-glass rounded-xl p-3 flex justify-between items-center border border-white/5">
+        <div class="glass-card rounded-xl p-4 flex justify-between items-center border border-slate-800/80 shadow-md">
           <div class="flex items-center gap-3">
-            <div class="w-9 h-9 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
-               <i class="fa-solid fa-gift text-sm"></i>
+            <div class="w-10 h-10 rounded-full bg-emerald-500/20 border border-emerald-500/50 flex items-center justify-center text-emerald-400 shadow-inner">
+               <i class="fa-solid fa-gift text-lg drop-shadow-md"></i>
             </div>
-            <div class="flex flex-col">
-              <span class="text-xs font-black text-white">${r.title}</span>
-              <span class="text-[9px] text-slate-400 max-w-[120px] truncate">${r.desc} • ${r.date}</span>
+            <div>
+              <p class="text-xs font-black text-white tracking-wide">${r.title}</p>
+              <p class="text-[10px] text-slate-400 mt-0.5 truncate max-w-[130px]">${r.desc}</p>
             </div>
           </div>
           <div class="text-right flex flex-col items-end">
-            <span class="text-[10px] font-black text-crypto-glow">+${r.xp} XP</span>
-            <span class="text-[10px] font-black text-emerald-400">+$${fmtNum(r.usd)}</span>
+            <span class="text-[11px] font-black text-crypto-glow">+${r.xp} XP</span>
+            <span class="text-[11px] font-black text-emerald-400 mt-0.5">+$${formatNum(r.usd, true)}</span>
           </div>
         </div>
       `).join('');
     }
 
-    function openReferralsView() {
-        document.querySelectorAll('.view-section').forEach(el => el.classList.add('hidden'));
-        document.getElementById('view-referrals').classList.remove('hidden');
-        window.scrollTo({ top: 0, behavior: 'smooth' });
-    }
-
+    // UI Navigation (Header ALWAYS visible, Padding handles offset)
     function switchTab(tabId) {
-      document.querySelectorAll('.view-section').forEach(el => el.classList.add('hidden'));
+      // Hide all sections
+      document.querySelectorAll('.view-section').forEach(el => {
+          el.classList.add('hidden');
+          el.classList.remove('animate-slide-up');
+      });
+      // Deactivate all nav buttons
       document.querySelectorAll('.nav-btn').forEach(btn => btn.classList.remove('nav-active'));
 
-      document.getElementById(`view-${tabId}`).classList.remove('hidden');
+      // Show target section with animation
+      const targetView = document.getElementById(`view-${tabId}`);
+      targetView.classList.remove('hidden');
+      targetView.classList.add('animate-slide-up');
       
-      const targetBtn = document.querySelector(`[data-target="${tabId}"]`);
-      if (targetBtn) targetBtn.classList.add('nav-active');
-      
-      const header = document.getElementById('main-header');
-      const mainContent = document.getElementById('app-content');
-
-      // Hide header for Withdraw, Show for others
-      if (tabId === 'withdraw' || tabId === 'referrals') {
-        header.style.transform = 'translateY(-120%)';
-        mainContent.classList.remove('pt-[110px]');
-        mainContent.classList.add('pt-4');
-      } else {
-        header.style.transform = 'translateY(0)';
-        mainContent.classList.remove('pt-4');
-        mainContent.classList.add('pt-[110px]');
-      }
+      // Activate target nav button
+      document.querySelector(`[data-target="${tabId}"]`).classList.add('nav-active');
       
       if (tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
       window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -1524,10 +1402,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         const m = Math.floor((diff / 1000 / 60) % 60);
         const s = Math.floor((diff / 1000) % 60);
         
-        const timerEl = document.getElementById('reset-timer');
-        if(timerEl) {
-          timerEl.innerText = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-        }
+        document.getElementById('reset-timer').innerText = 
+          `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
     }
     
     async function initApp() {
@@ -1535,13 +1411,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       
       setTimeout(() => {
         document.getElementById('loading-overlay').style.opacity = '0';
-        setTimeout(() => { document.getElementById('loading-overlay').style.display = 'none'; }, 700); 
-      }, 700);
+        setTimeout(() => { document.getElementById('loading-overlay').style.display = 'none'; }, 500); 
+      }, 600);
       
       setInterval(updateTimer, 1000);
       updateTimer();
     }
 
+    // Start App
     window.addEventListener('load', initApp);
   </script>
 </body>

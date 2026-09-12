@@ -1,279 +1,293 @@
 <?php
-/**
- * POINT PLAY - Earning & Ad Platform
- * Architecture: Users -> Ads -> Tasks -> Referrals -> XP -> USD Balance -> Wallet
- * Storage: JSON Flat-file with locking
- */
+// POINT PLAY - SINGLE FILE ARCHITECTURE
+// All server-side logic and persistence is handled here.
 
-define('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE'); // Set your actual Bot Token here for strict validation
-define('DATA_DIR', __DIR__ . '/data');
-define('USERS_DIR', DATA_DIR . '/users');
+error_reporting(0); // Suppress errors for clean JSON API responses in production
+$dataDir = __DIR__ . '/data';
 
-// 1. Storage Initialization
-if (!file_exists(DATA_DIR)) mkdir(DATA_DIR, 0777, true);
-if (!file_exists(USERS_DIR)) mkdir(USERS_DIR, 0777, true);
-
-// 2. Core Functions
-function get_user_file($tg_id) {
-    return USERS_DIR . '/' . preg_replace('/[^0-9]/', '', $tg_id) . '.json';
+// Create data directory if it doesn't exist
+if (!is_dir($dataDir)) {
+    mkdir($dataDir, 0777, true);
 }
 
-function lock_and_read($file) {
-    if (!file_exists($file)) return null;
-    $fp = fopen($file, 'r');
-    if (flock($fp, LOCK_SH)) {
-        $size = filesize($file);
-        $data = $size > 0 ? fread($fp, $size) : null;
-        flock($fp, LOCK_UN);
-        fclose($fp);
-        return $data ? json_decode($data, true) : null;
-    }
-    fclose($fp);
-    return null;
-}
-
-function lock_and_write($file, $data) {
-    $fp = fopen($file, 'c');
-    if (flock($fp, LOCK_EX)) {
-        ftruncate($fp, 0);
-        rewind($fp);
-        fwrite($fp, json_encode($data, JSON_PRETTY_PRINT));
-        flock($fp, LOCK_UN);
-        fclose($fp);
-        return true;
-    }
-    fclose($fp);
-    return false;
-}
-
-function validate_telegram_data($init_data) {
-    // Basic structural parse
-    parse_str($init_data, $parsed_data);
-    if (!isset($parsed_data['hash'])) return false;
+// Helper: Safe read JSON with shared lock
+function readDB($filename) {
+    global $dataDir;
+    $path = "$dataDir/$filename";
+    if (!file_exists($path)) return [];
     
-    // Strict Hash Validation (if BOT_TOKEN is set)
-    if (BOT_TOKEN !== 'YOUR_BOT_TOKEN_HERE' && !empty(BOT_TOKEN)) {
-        $hash = $parsed_data['hash'];
-        unset($parsed_data['hash']);
-        ksort($parsed_data);
-        $data_check_arr = [];
-        foreach ($parsed_data as $key => $value) {
-            $data_check_arr[] = $key . '=' . $value;
-        }
-        $data_check_string = implode("\n", $data_check_arr);
-        $secret_key = hash_hmac('sha256', BOT_TOKEN, 'WebAppData', true);
-        $calculated_hash = bin2hex(hash_hmac('sha256', $data_check_string, $secret_key, true));
-        if (!hash_equals($calculated_hash, $hash)) return false;
-    }
-
-    return isset($parsed_data['user']) ? json_decode($parsed_data['user'], true) : false;
+    $fp = fopen($path, 'r');
+    if (!$fp) return [];
+    flock($fp, LOCK_SH);
+    $size = filesize($path);
+    $json = $size > 0 ? fread($fp, $size) : '[]';
+    flock($fp, LOCK_UN);
+    fclose($fp);
+    
+    return json_decode($json, true) ?: [];
 }
 
-function create_user_template($tg_user, $referrer_id = null) {
-    return [
-        'telegram_id' => (string)$tg_user['id'],
-        'username' => $tg_user['username'] ?? '',
-        'first_name' => $tg_user['first_name'] ?? 'User',
-        'last_name' => $tg_user['last_name'] ?? '',
-        'created_at' => date('Y-m-d H:i:s'),
-        'last_active_at' => date('Y-m-d H:i:s'),
-        'xp' => 0,
-        'usd_balance' => 0.00,
-        'total_ads' => 0,
-        'daily_ads' => 0,
-        'last_ad_date' => '',
-        'completed_tasks' => 0,
-        'task_ids' => [],
-        'daily_login_date' => '',
-        'azx_crypto_completed' => false,
-        'referrer_id' => $referrer_id,
-        'referrals' => [], // List of referred users
-        'pending_referrals' => 0,
-        'approved_referrals' => 0,
-        'referral_rewards' => [],
-        'withdrawals' => []
-    ];
+// Helper: Safe write JSON with exclusive lock
+function writeDB($filename, $data) {
+    global $dataDir;
+    $path = "$dataDir/$filename";
+    $fp = fopen($path, 'c');
+    if (!$fp) return false;
+    flock($fp, LOCK_EX);
+    ftruncate($fp, 0);
+    fwrite($fp, json_encode($data, JSON_PRETTY_PRINT));
+    flock($fp, LOCK_UN);
+    fclose($fp);
+    return true;
 }
 
-function update_referrer_progress($referrer_id, $child_id, $child_name, $child_username, $ad_count, $task_count) {
-    if (!$referrer_id) return;
-    $ref_file = get_user_file($referrer_id);
-    $ref_data = lock_and_read($ref_file);
-    if (!$ref_data) return;
-
-    $found = false;
-    foreach ($ref_data['referrals'] as &$ref) {
-        if ($ref['uid'] === $child_id) {
-            $found = true;
-            $ref['ad_progress'] = $ad_count;
-            $ref['task_progress'] = $task_count;
-            $ref['name'] = $child_name;
-            $ref['username'] = $child_username;
-
-            // Check Approval Condition (25 Ads AND 5 Tasks)
-            if ($ref['status'] === 'pending' && $ad_count >= 25 && $task_count >= 5) {
-                $ref['status'] = 'approved';
-                $ref_data['pending_referrals'] = max(0, $ref_data['pending_referrals'] - 1);
-                $ref_data['approved_referrals']++;
-                
-                // Reward Referrer
-                $ref_data['xp'] += 250;
-                $ref_data['usd_balance'] += 0.025;
-                
-                array_unshift($ref_data['referral_rewards'], [
-                    'date' => date('Y-m-d H:i:s'),
-                    'child_name' => $child_name,
-                    'xp' => 250,
-                    'usd' => 0.025
-                ]);
-            }
-            break;
-        }
-    }
-
-    // Register missing referral mapping safely
-    if (!$found) {
-        $ref_data['referrals'][] = [
-            'uid' => $child_id,
-            'name' => $child_name,
-            'username' => $child_username,
-            'status' => 'pending',
-            'ad_progress' => $ad_count,
-            'task_progress' => $task_count,
-            'date' => date('Y-m-d')
-        ];
-        $ref_data['pending_referrals']++;
-    }
-
-    lock_and_write($ref_file, $ref_data);
-}
-
-// 3. API Logic (Server-Side Endpoints)
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
+// Handle API requests
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Content-Type: application/json');
     $input = json_decode(file_get_contents('php://input'), true);
     
-    if (!isset($input['initData'])) {
-        echo json_encode(['success' => false, 'error' => 'No Auth Data']);
+    if (!$input || !isset($input['action']) || !isset($input['tgId'])) {
+        echo json_encode(['error' => 'Invalid request']);
         exit;
     }
 
-    $tg_user = validate_telegram_data($input['initData']);
-    if (!$tg_user) {
-        echo json_encode(['success' => false, 'error' => 'Invalid Telegram Identity']);
-        exit;
+    $action = $input['action'];
+    $uid = (string)$input['tgId'];
+    $today = date('Y-m-d');
+    
+    $users = readDB('users.json');
+    $referrals = readDB('referrals.json');
+    $rewards = readDB('rewards.json');
+    $withdrawals = readDB('withdrawals.json');
+    $tasks = readDB('tasks.json'); // Daily tasks tracking
+    
+    // 1. User Initialization & Restoration
+    if (!isset($users[$uid])) {
+        // Create new user
+        $users[$uid] = [
+            'tgId' => $uid,
+            'firstName' => $input['firstName'] ?? 'User',
+            'username' => $input['username'] ?? '',
+            'photoUrl' => $input['photoUrl'] ?? '',
+            'xp' => 0,
+            'totalXp' => 0,
+            'usd' => 0.00,
+            'level' => 1,
+            'adsWatchedToday' => 0,
+            'totalAdsWatched' => 0,
+            'tasksCompleted' => 0,
+            'boxesOpened' => 0,
+            'streak' => 1,
+            'lastResetDay' => $today,
+            'referrer' => null,
+            'azxCryptoTaskCompleted' => false
+        ];
+
+        // Process referral joining
+        if (!empty($input['referrer']) && $input['referrer'] !== $uid) {
+            $refId = (string)$input['referrer'];
+            if (isset($users[$refId])) {
+                $users[$uid]['referrer'] = $refId;
+                if (!isset($referrals[$refId])) $referrals[$refId] = [];
+                
+                // Add to referrer's list
+                $referrals[$refId][] = [
+                    'uid' => $uid,
+                    'name' => $users[$uid]['firstName'],
+                    'username' => $users[$uid]['username'],
+                    'status' => 'Pending',
+                    'ads' => 0,
+                    'tasks' => 0,
+                    'joinDate' => date('M j, Y')
+                ];
+                writeDB('referrals.json', $referrals);
+            }
+        }
     }
 
-    $tg_id = (string)$tg_user['id'];
-    $user_file = get_user_file($tg_id);
-    $action = $_GET['api'];
+    // Daily Reset Logic
+    if ($users[$uid]['lastResetDay'] !== $today) {
+        $lastDay = strtotime($users[$uid]['lastResetDay']);
+        $currDay = strtotime($today);
+        $diff = round(($currDay - $lastDay) / 86400);
+        
+        if ($diff === 1) {
+            $users[$uid]['streak'] = min($users[$uid]['streak'] + 1, 7);
+        } else {
+            $users[$uid]['streak'] = 1;
+        }
+        
+        $users[$uid]['adsWatchedToday'] = 0;
+        $users[$uid]['lastResetDay'] = $today;
+        
+        // Reset daily tasks
+        if(isset($tasks[$uid])) {
+            $tasks[$uid] = [];
+        }
+    }
 
-    // Global file lock for user updates
-    $fp = fopen($user_file, 'c+');
-    if (flock($fp, LOCK_EX)) {
-        $size = filesize($user_file);
-        $user = $size > 0 ? json_decode(fread($fp, $size), true) : null;
-        $today = date('Y-m-d');
+    // Helper: Level Calculation
+    function calcLevel($xp) {
+        if ($xp >= 20000) return 10;
+        if ($xp >= 3000) return 5;
+        if ($xp >= 1500) return 4;
+        if ($xp >= 750) return 3;
+        if ($xp >= 250) return 2;
+        return 1;
+    }
 
-        if (!$user) {
-            // Check for valid referrer
-            $referrer_id = null;
-            if (isset($input['start_param']) && !empty($input['start_param'])) {
-                $pot_ref = preg_replace('/[^0-9]/', '', $input['start_param']);
-                if ($pot_ref !== $tg_id && file_exists(get_user_file($pot_ref))) {
-                    $referrer_id = $pot_ref;
+    // Helper: Evaluate Referral Approval
+    function evaluateReferralProgress($refUid, &$users, &$referrals, &$rewards) {
+        $refUser = $users[$refUid];
+        if (empty($refUser['referrer'])) return;
+        
+        $referrerId = $refUser['referrer'];
+        if (!isset($referrals[$referrerId])) return;
+        
+        $changed = false;
+        foreach ($referrals[$referrerId] as &$r) {
+            if ($r['uid'] === $refUid && $r['status'] === 'Pending') {
+                $r['ads'] = $refUser['totalAdsWatched'];
+                $r['tasks'] = $refUser['tasksCompleted'];
+                
+                if ($r['ads'] >= 25 && $r['tasks'] >= 5) {
+                    $r['status'] = 'Approved';
+                    $r['approvedAt'] = date('M j, Y');
+                    $changed = true;
+                    
+                    // Grant 250 XP and $0.025 USD to referrer exactly once
+                    $users[$referrerId]['xp'] += 250;
+                    $users[$referrerId]['totalXp'] += 250;
+                    $users[$referrerId]['level'] = calcLevel($users[$referrerId]['totalXp']);
+                    $users[$referrerId]['usd'] += 0.025;
+                    
+                    // Log Reward
+                    if (!isset($rewards[$referrerId])) $rewards[$referrerId] = [];
+                    array_unshift($rewards[$referrerId], [
+                        'title' => 'Referral Bonus',
+                        'desc' => "Referral: " . $refUser['firstName'],
+                        'xp' => 250,
+                        'usd' => 0.025,
+                        'date' => date('M j, Y')
+                    ]);
                 }
-            }
-            $user = create_user_template($tg_user, $referrer_id);
-            if ($referrer_id) {
-                update_referrer_progress($referrer_id, $tg_id, $user['first_name'], $user['username'], 0, 0);
+                break;
             }
         }
-
-        // Reset daily stats
-        if ($user['last_ad_date'] !== $today) {
-            $user['daily_ads'] = 0;
-            $user['last_ad_date'] = $today;
+        if ($changed) {
+            writeDB('referrals.json', $referrals);
+            writeDB('rewards.json', $rewards);
         }
+    }
 
-        $user['last_active_at'] = date('Y-m-d H:i:s');
-        $user['username'] = $tg_user['username'] ?? '';
-        $user['first_name'] = $tg_user['first_name'] ?? 'User';
-        $user['last_name'] = $tg_user['last_name'] ?? '';
+    // Process Specific Actions
+    $response = ['success' => true];
 
-        // Routing
-        if ($action === 'init') {
-            // Just returns the loaded user
-        } 
-        elseif ($action === 'watch_ad') {
-            $user['xp'] += 20;
-            $user['total_ads'] += 1;
-            $user['daily_ads'] += 1;
-            update_referrer_progress($user['referrer_id'], $tg_id, $user['first_name'], $user['username'], $user['total_ads'], $user['completed_tasks']);
-        } 
-        elseif ($action === 'claim_daily') {
-            if ($user['daily_login_date'] !== $today) {
-                $user['xp'] += 50;
-                $user['daily_login_date'] = $today;
+    switch ($action) {
+        case 'watch_ad':
+            if ($users[$uid]['adsWatchedToday'] < 30) {
+                $users[$uid]['adsWatchedToday'] += 1;
+                $users[$uid]['totalAdsWatched'] += 1;
+                $users[$uid]['xp'] += 20;
+                $users[$uid]['totalXp'] += 20;
+                $users[$uid]['level'] = calcLevel($users[$uid]['totalXp']);
+                evaluateReferralProgress($uid, $users, $referrals, $rewards);
             } else {
-                echo json_encode(['success' => false, 'error' => 'Already claimed today']);
-                flock($fp, LOCK_UN); fclose($fp); exit;
+                $response['error'] = 'Ad limit reached';
             }
-        } 
-        elseif ($action === 'complete_task') {
-            $task_id = $input['task_id'] ?? '';
-            $tasks_config = [
-                'watch_5' => ['target' => 5, 'xp' => 100],
-                'watch_30' => ['target' => 30, 'xp' => 300]
-            ];
+            break;
 
-            if (isset($tasks_config[$task_id]) && !in_array($task_id, $user['task_ids'])) {
-                if ($user['daily_ads'] >= $tasks_config[$task_id]['target']) {
-                    $user['xp'] += $tasks_config[$task_id]['xp'];
-                    $user['task_ids'][] = $task_id;
-                    $user['completed_tasks'] += 1;
-                    update_referrer_progress($user['referrer_id'], $tg_id, $user['first_name'], $user['username'], $user['total_ads'], $user['completed_tasks']);
+        case 'claim_task':
+            $taskId = $input['taskId'] ?? '';
+            if (!isset($tasks[$uid])) $tasks[$uid] = [];
+            
+            if (!in_array($taskId, $tasks[$uid])) {
+                $rewardXp = (int)($input['reward'] ?? 0);
+                if ($rewardXp > 0 && $rewardXp <= 100) { // basic security cap for daily missions
+                    $tasks[$uid][] = $taskId;
+                    $users[$uid]['tasksCompleted'] += 1;
+                    $users[$uid]['xp'] += $rewardXp;
+                    $users[$uid]['totalXp'] += $rewardXp;
+                    $users[$uid]['level'] = calcLevel($users[$uid]['totalXp']);
+                    evaluateReferralProgress($uid, $users, $referrals, $rewards);
+                    writeDB('tasks.json', $tasks);
                 }
             }
-        } 
-        elseif ($action === 'azx_crypto') {
-            if ($user['azx_crypto_completed'] === false) {
-                $user['xp'] += 200;
-                $user['azx_crypto_completed'] = true;
-                $user['completed_tasks'] += 1;
-                update_referrer_progress($user['referrer_id'], $tg_id, $user['first_name'], $user['username'], $user['total_ads'], $user['completed_tasks']);
+            break;
+
+        case 'claim_azx':
+            if (empty($users[$uid]['azxCryptoTaskCompleted'])) {
+                $users[$uid]['azxCryptoTaskCompleted'] = true;
+                $users[$uid]['xp'] += 200;
+                $users[$uid]['totalXp'] += 200;
+                $users[$uid]['level'] = calcLevel($users[$uid]['totalXp']);
+                evaluateReferralProgress($uid, $users, $referrals, $rewards);
+            } else {
+                $response['error'] = 'Task already claimed';
             }
-        }
-        elseif ($action === 'withdraw') {
-            $amount = floatval($input['amount'] ?? 0);
-            $address = trim(strip_tags($input['address'] ?? ''));
-            if ($amount >= 10 && $amount <= $user['usd_balance'] && !empty($address)) {
-                $user['usd_balance'] -= $amount;
-                array_unshift($user['withdrawals'], [
-                    'id' => strtoupper(uniqid('WD-')),
-                    'date' => date('Y-m-d H:i'),
+            break;
+
+        case 'open_box':
+            $type = $input['boxType'] ?? '';
+            $costs = ['bronze' => 10000, 'silver' => 50000, 'gold' => 100000];
+            
+            if (isset($costs[$type]) && $users[$uid]['xp'] >= $costs[$type]) {
+                $users[$uid]['xp'] -= $costs[$type];
+                $users[$uid]['boxesOpened'] += 1;
+                
+                $isJackpot = (rand(1, 10000) === 1); 
+                $rewardUsd = 0;
+                
+                if ($type === 'bronze') $rewardUsd = $isJackpot ? 1.00 : 0.10;
+                if ($type === 'silver') $rewardUsd = $isJackpot ? 7.00 : 0.50;
+                if ($type === 'gold') $rewardUsd = $isJackpot ? 15.00 : 1.00;
+                
+                $users[$uid]['usd'] += $rewardUsd;
+                $response['reward'] = $rewardUsd;
+                $response['jackpot'] = $isJackpot;
+            } else {
+                $response['error'] = 'Not enough XP';
+            }
+            break;
+
+        case 'withdraw':
+            $amount = (float)($input['amount'] ?? 0);
+            $address = $input['address'] ?? '';
+            
+            if ($amount >= 10 && $amount <= $users[$uid]['usd'] && strlen($address) > 5) {
+                $users[$uid]['usd'] -= $amount;
+                
+                if (!isset($withdrawals[$uid])) $withdrawals[$uid] = [];
+                array_unshift($withdrawals[$uid], [
+                    'id' => '#' . strtoupper(substr(md5(uniqid()), 0, 6)),
                     'amount' => $amount,
-                    'address' => $address,
+                    'address' => substr($address, 0, 6) . '...' . substr($address, -4),
+                    'date' => date('M j, Y'),
                     'status' => 'Pending'
                 ]);
+                writeDB('withdrawals.json', $withdrawals);
             } else {
-                echo json_encode(['success' => false, 'error' => 'Invalid withdrawal request']);
-                flock($fp, LOCK_UN); fclose($fp); exit;
+                $response['error'] = 'Invalid withdrawal request';
             }
-        }
-
-        // Save State
-        ftruncate($fp, 0);
-        rewind($fp);
-        fwrite($fp, json_encode($user, JSON_PRETTY_PRINT));
-        flock($fp, LOCK_UN);
-        fclose($fp);
-
-        echo json_encode(['success' => true, 'user' => $user]);
-    } else {
-        echo json_encode(['success' => false, 'error' => 'Resource busy']);
-        fclose($fp);
+            break;
+            
+        case 'game_level_clear':
+            $rewardXp = 50; 
+            $users[$uid]['xp'] += $rewardXp;
+            $users[$uid]['totalXp'] += $rewardXp;
+            $users[$uid]['level'] = calcLevel($users[$uid]['totalXp']);
+            break;
     }
+
+    writeDB('users.json', $users);
+    
+    $response['user'] = $users[$uid];
+    $response['referrals'] = $referrals[$uid] ?? [];
+    $response['rewards'] = $rewards[$uid] ?? [];
+    $response['withdrawals'] = $withdrawals[$uid] ?? [];
+    $response['tasks'] = $tasks[$uid] ?? [];
+    
+    echo json_encode($response);
     exit;
 }
 ?>
@@ -281,542 +295,1099 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_GET['api'])) {
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Point Play</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>Point Play - Telegram Mini App</title>
+  
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <script src="https://sad.adsgram.ai/js/sad.min.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800;900&display=swap" rel="stylesheet">
-  
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800;900&display=swap" rel="stylesheet">
+
   <script>
     tailwind.config = {
       theme: {
         extend: {
           fontFamily: { sans: ['Outfit', 'sans-serif'] },
-          colors: { app: { dark: '#050511', card: '#0a0b1a', primary: '#3b82f6', glow: '#00f0ff' } }
+          colors: {
+            crypto: {
+              dark: '#050511',     
+              card: '#0a0b1a',     
+              primary: '#3b82f6',  
+              glow: '#00f0ff',     
+              gold: '#ffb800',     
+              silver: '#e2e8f0',   
+              bronze: '#cd7f32'    
+            }
+          },
+          animation: {
+            'blob': 'blob 7s infinite',
+            'pulse-fast': 'pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+            'float-up': 'floatUp 2s ease-out forwards',
+            'pop': 'pop 0.3s ease-out forwards',
+            'shimmer': 'shimmer 2s infinite'
+          },
+          keyframes: {
+            blob: {
+              '0%': { transform: 'translate(0px, 0px) scale(1)' },
+              '33%': { transform: 'translate(30px, -50px) scale(1.1)' },
+              '66%': { transform: 'translate(-20px, 20px) scale(0.9)' },
+              '100%': { transform: 'translate(0px, 0px) scale(1)' },
+            },
+            floatUp: {
+              '0%': { transform: 'translateY(0) scale(1)', opacity: 1 },
+              '100%': { transform: 'translateY(-100px) scale(0.5)', opacity: 0 }
+            },
+            pop: {
+              '0%': { transform: 'scale(1)' },
+              '50%': { transform: 'scale(1.3)' },
+              '100%': { transform: 'scale(0)', opacity: 0 }
+            },
+            shimmer: {
+              '0%': { transform: 'translateX(-100%)' },
+              '100%': { transform: 'translateX(100%)' }
+            }
+          }
         }
       }
     }
   </script>
 
   <style>
-    body { background-color: #050511; color: #f8fafc; -webkit-tap-highlight-color: transparent; }
-    ::-webkit-scrollbar { display: none; }
-    
+    body {
+      background-color: #050511;
+      color: #f8fafc;
+      overflow-x: hidden;
+      -webkit-touch-callout: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    .bg-orb-1 {
+      position: fixed; top: -10%; left: -10%; width: 50vw; height: 50vw;
+      background: radial-gradient(circle, rgba(59, 130, 246, 0.15) 0%, rgba(0, 0, 0, 0) 70%);
+      z-index: -1; filter: blur(40px);
+    }
+    .bg-orb-2 {
+      position: fixed; bottom: -10%; right: -10%; width: 60vw; height: 60vw;
+      background: radial-gradient(circle, rgba(0, 240, 255, 0.1) 0%, rgba(0, 0, 0, 0) 70%);
+      z-index: -1; filter: blur(50px);
+    }
+
+    input { user-select: auto !important; }
+    img { pointer-events: none; }
+    ::-webkit-scrollbar { width: 0px; background: transparent; }
+
     .glass-card {
       background: linear-gradient(145deg, rgba(20, 22, 45, 0.6) 0%, rgba(10, 11, 26, 0.8) 100%);
       backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
       border: 1px solid rgba(255, 255, 255, 0.05);
       box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
     }
+    
+    .glass-button {
+      background: linear-gradient(135deg, rgba(59,130,246,0.2) 0%, rgba(0,240,255,0.1) 100%);
+      border: 1px solid rgba(0,240,255,0.3);
+      box-shadow: 0 0 15px rgba(0,240,255,0.1) inset;
+    }
+
     .fade-in { animation: fadeIn 0.3s ease-out forwards; }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-    
+
     .nav-active { color: #00f0ff !important; transform: translateY(-2px); }
     .nav-active i { filter: drop-shadow(0 0 8px rgba(0, 240, 255, 0.6)); }
+    .nav-active::before {
+      content: ''; position: absolute; top: -10px; left: 50%; transform: translateX(-50%);
+      width: 20px; height: 4px; background: #00f0ff; border-radius: 4px;
+      box-shadow: 0 0 12px #00f0ff, 0 0 20px #3b82f6;
+    }
+
+    .btn-3d {
+      background: linear-gradient(to bottom, #3b82f6, #2563eb);
+      border-bottom: 3px solid #1e3a8a;
+      transition: all 0.1s;
+    }
+    .btn-3d:active {
+      transform: translateY(3px);
+      border-bottom-width: 0px;
+      margin-bottom: 3px;
+    }
 
     #toast-container {
       position: fixed; top: 1.5rem; left: 50%; transform: translate(-50%, -150%) scale(0.9);
-      width: 90%; max-width: 380px; z-index: 999999; transition: all 0.5s cubic-bezier(0.68, -0.55, 0.265, 1.55);
+      width: 90%; max-width: 380px; z-index: 999999;
+      transition: all 0.5s cubic-bezier(0.68, -0.55, 0.265, 1.55);
       opacity: 0; pointer-events: none;
     }
     .toast-show { transform: translate(-50%, 0) scale(1) !important; opacity: 1 !important; }
+
+    .box-bronze { background: linear-gradient(135deg, rgba(205,127,50,0.1), rgba(139,69,19,0.2)); border: 1px solid rgba(205,127,50,0.4); }
+    .box-silver { background: linear-gradient(135deg, rgba(226,232,240,0.1), rgba(148,163,184,0.2)); border: 1px solid rgba(226,232,240,0.4); }
+    .box-gold { background: linear-gradient(135deg, rgba(255,184,0,0.15), rgba(217,119,6,0.25)); border: 1px solid rgba(255,184,0,0.5); }
+
+    .modal-overlay {
+      background: rgba(5, 5, 17, 0.85);
+      backdrop-filter: blur(8px);
+      z-index: 10000;
+    }
   </style>
 </head>
 <body class="flex flex-col min-h-screen pb-32">
+  
+  <div class="bg-orb-1 animate-blob"></div>
+  <div class="bg-orb-2 animate-blob animation-delay-2000"></div>
 
-  <!-- Toast Notification -->
-  <div id="toast-container" class="glass-card rounded-2xl p-4 flex items-center gap-4 border border-slate-700">
-    <div id="toast-icon" class="w-12 h-12 rounded-xl flex shrink-0 items-center justify-center text-xl bg-blue-500/20 text-app-glow">
+  <!-- Start Screen -->
+  <div id="loading-overlay" class="bg-[#050511] flex flex-col items-center justify-center z-[100000] fixed inset-0 transition-opacity duration-500">
+    <div class="relative w-24 h-24 mb-8">
+      <div class="absolute inset-0 rounded-full border-t-4 border-crypto-glow animate-[spin_1s_linear_infinite] shadow-[0_0_20px_rgba(0,240,255,0.5)]"></div>
+      <div class="absolute inset-3 rounded-full border-b-4 border-blue-500 animate-[spin_1.5s_linear_infinite_reverse]"></div>
+      <div class="absolute inset-0 flex items-center justify-center">
+        <i class="fa-solid fa-gamepad text-crypto-glow text-3xl animate-pulse"></i>
+      </div>
+    </div>
+    <h2 class="text-white font-black tracking-[0.25em] text-2xl uppercase bg-clip-text text-transparent bg-gradient-to-r from-crypto-glow via-blue-400 to-indigo-500 mb-2 drop-shadow-lg">Point Play</h2>
+  </div>
+
+  <!-- Notification Toast -->
+  <div id="toast-container" class="glass-card rounded-2xl p-4 flex items-center gap-4">
+    <div id="toast-icon" class="w-12 h-12 rounded-full flex shrink-0 items-center justify-center text-xl shadow-inner">
       <i class="fa-solid fa-bell"></i>
     </div>
     <div class="flex-1">
       <h4 id="toast-title" class="text-sm font-black text-white tracking-wide">Notification</h4>
-      <p id="toast-message" class="text-xs text-slate-300 mt-0.5 leading-tight">Message</p>
+      <p id="toast-message" class="text-xs text-slate-300 mt-0.5 leading-tight">Message goes here</p>
     </div>
   </div>
 
-  <!-- Header -->
-  <header id="main-header" class="fixed top-0 left-0 right-0 z-50 w-full p-4 glass-card rounded-b-3xl border-b-0 shadow-lg">
+  <!-- HEADER SPACING FIX: Added dynamic padding-top -->
+  <header id="main-header" class="fixed top-0 left-0 right-0 z-50 w-full p-4 glass-card rounded-b-3xl border-b-0 shadow-lg transition-transform duration-300" style="padding-top: max(1rem, env(safe-area-inset-top));">
     <div class="flex justify-between items-center max-w-md mx-auto">
       <div class="flex items-center gap-3">
-        <div class="relative w-11 h-11 rounded-full p-[2px] bg-gradient-to-tr from-blue-600 to-app-glow">
-          <img id="ui-avatar" src="https://via.placeholder.com/150" class="w-full h-full rounded-full object-cover border-2 border-app-dark">
+        <div class="relative w-11 h-11 rounded-full p-[2px] bg-gradient-to-tr from-blue-600 via-crypto-glow to-indigo-500 shadow-[0_0_15px_rgba(0,240,255,0.3)]">
+          <img id="user-photo" src="https://via.placeholder.com/150/0a0b1a/00f0ff?text=PP" alt="Profile" class="w-full h-full rounded-full object-cover border-2 border-[#050511]">
         </div>
         <div class="flex flex-col">
-          <span id="ui-name" class="font-bold text-white text-sm tracking-wide">Loading...</span>
-          <span class="text-[10px] text-slate-400 font-bold uppercase">Point Play User</span>
+          <span id="user-name" class="font-bold text-white text-sm tracking-wide">Loading...</span>
+          <div class="flex items-center gap-1">
+            <span class="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_8px_#34d399] animate-pulse"></span>
+            <span class="text-[10px] text-slate-400 uppercase font-bold tracking-wider">Online</span>
+          </div>
         </div>
       </div>
       <div class="flex flex-col items-end gap-1.5">
-        <div class="bg-blue-900/40 border border-app-glow/30 px-3 py-1.5 rounded-xl flex items-center gap-2">
-          <i class="fa-solid fa-bolt text-app-glow text-xs"></i>
-          <span id="ui-xp" class="text-white font-black text-sm tracking-wider">0 XP</span>
+        <div class="glass-button px-3 py-1.5 rounded-xl flex items-center gap-2">
+          <i class="fa-solid fa-bolt text-crypto-glow text-xs drop-shadow-[0_0_5px_#00f0ff]"></i>
+          <span id="user-xp" class="text-white font-black text-sm tracking-wider">0 <span class="text-[10px] text-crypto-glow">XP</span></span>
         </div>
-        <div class="bg-emerald-900/40 border border-emerald-500/30 px-3 py-1 rounded-xl flex items-center gap-2">
+        <div class="bg-emerald-900/40 border border-emerald-500/30 px-3 py-1 rounded-xl flex items-center gap-2 shadow-[0_0_10px_rgba(16,185,129,0.1)inset]">
           <i class="fa-solid fa-dollar-sign text-emerald-400 text-[10px]"></i>
-          <span id="ui-usd" class="text-emerald-400 font-black text-xs tracking-wider">0.00</span>
+          <span id="user-usd" class="text-emerald-400 font-black text-xs tracking-wider">0.0000</span>
         </div>
       </div>
     </div>
   </header>
 
-  <!-- App Content -->
-  <main class="flex-1 max-w-md w-full mx-auto p-4 pt-24 relative" id="app-content">
+  <!-- BODY CONTENT: Adjusted pt-[120px] to accommodate modified header -->
+  <main class="flex-1 max-w-md w-full mx-auto p-4 pt-[120px] relative" id="app-content">
     
-    <!-- HOME VIEW -->
+    <!-- HOME PAGE -->
     <div id="view-home" class="view-section fade-in space-y-6">
-      <div class="glass-card rounded-[2rem] p-6 text-center flex flex-col items-center">
-        <div class="w-16 h-16 rounded-full bg-blue-900/40 border border-blue-400/30 flex items-center justify-center mb-4">
-             <i class="fa-solid fa-star text-3xl text-app-glow"></i>
+      <div class="relative glass-card rounded-[2rem] p-6 text-center border-t border-t-blue-400/20 overflow-hidden flex flex-col items-center justify-center min-h-[240px]">
+        <div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-48 h-48 bg-blue-500/20 rounded-full filter blur-[40px] pointer-events-none animate-pulse-fast"></div>
+        <div class="relative z-10 flex flex-col items-center">
+          <div class="w-14 h-14 rounded-full bg-blue-900/40 border border-blue-400/30 flex items-center justify-center mb-3 shadow-[0_0_20px_rgba(59,130,246,0.3)]">
+             <i class="fa-solid fa-gem text-2xl text-crypto-glow drop-shadow-[0_0_10px_rgba(0,240,255,0.8)]"></i>
+          </div>
+          <p class="text-[10px] font-black text-blue-400 uppercase tracking-[0.3em] mb-1 opacity-80">Balance</p>
+          <h1 class="text-5xl font-black text-transparent bg-clip-text bg-gradient-to-b from-white via-cyan-100 to-blue-400 tracking-tighter drop-shadow-2xl" id="main-xp-display">0 XP</h1>
         </div>
-        <h1 class="text-5xl font-black text-white tracking-tighter" id="ui-main-xp">0 XP</h1>
         <div class="w-full mt-6 grid grid-cols-2 gap-3">
-          <div class="bg-app-dark/50 border border-slate-700/50 p-3 rounded-2xl flex items-center gap-3">
-            <div class="bg-blue-500/10 p-2.5 rounded-xl"><i class="fa-solid fa-clapperboard text-blue-400"></i></div>
+          <div class="bg-[#050511]/50 border border-slate-700/50 p-3 rounded-2xl flex items-center gap-3 backdrop-blur-md">
+            <div class="bg-blue-500/10 p-2.5 rounded-xl border border-blue-500/20"><i class="fa-solid fa-clapperboard text-blue-400"></i></div>
             <div class="text-left">
-              <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider">Total Ads</p>
-              <p class="text-sm font-black text-white" id="ui-total-ads">0</p>
+              <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider">Daily Limit</p>
+              <p class="text-sm font-black text-white"><span id="ads-watched" class="text-blue-400">0</span> / 30</p>
             </div>
           </div>
-          <div class="bg-app-dark/50 border border-slate-700/50 p-3 rounded-2xl flex items-center gap-3">
-            <div class="bg-purple-500/10 p-2.5 rounded-xl"><i class="fa-solid fa-check text-purple-400"></i></div>
+          <div class="bg-[#050511]/50 border border-slate-700/50 p-3 rounded-2xl flex items-center gap-3 backdrop-blur-md">
+            <div class="bg-amber-500/10 p-2.5 rounded-xl border border-amber-500/20"><i class="fa-solid fa-fire-flame-curved text-amber-400"></i></div>
             <div class="text-left">
-              <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider">Daily Login</p>
-              <button id="ui-daily-btn" onclick="claimDaily()" class="text-xs font-black text-purple-400 mt-1 uppercase">Claim</button>
+              <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider">Streak</p>
+              <p class="text-sm font-black text-white"><span id="streak-days" class="text-amber-400">1</span> Days</p>
             </div>
           </div>
         </div>
       </div>
 
-      <button onclick="watchAd()" id="btn-watch-ad" class="w-full py-4 rounded-2xl bg-gradient-to-r from-blue-600 to-cyan-500 text-white font-black tracking-widest uppercase flex items-center justify-center gap-3 shadow-[0_10px_30px_rgba(0,240,255,0.3)] active:scale-95 transition-all">
-        <i class="fa-solid fa-play bg-white/20 p-2 rounded-full text-xs"></i> 
+      <button onclick="watchAd()" id="watch-ad-btn" class="w-full py-4 rounded-2xl text-white font-black text-sm tracking-[0.15em] uppercase flex items-center justify-center gap-3 shadow-[0_10px_30px_rgba(59,130,246,0.3)] btn-3d relative overflow-hidden group">
+        <div class="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent -translate-x-full group-hover:animate-[shimmer_1.5s_infinite]"></div>
+        <i class="fa-solid fa-play bg-white/20 p-2 rounded-full text-[10px]"></i> 
         <span>Watch Ad <span class="text-cyan-200">+20 XP</span></span>
       </button>
+
+      <div class="glass-card rounded-xl p-3 flex justify-between items-center">
+        <div class="flex items-center gap-2 text-slate-400 text-xs">
+          <i class="fa-solid fa-rotate text-blue-400"></i> <span>Resets in:</span>
+        </div>
+        <span class="text-white font-mono font-bold tracking-widest" id="reset-timer">--:--:--</span>
+      </div>
     </div>
 
-    <!-- TASKS VIEW -->
-    <div id="view-tasks" class="view-section hidden fade-in space-y-6">
+    <!-- PROFILE PAGE (NEWLY INTEGRATED) -->
+    <div id="view-profile" class="view-section hidden fade-in space-y-6 pb-4">
       <div class="text-center pt-2">
-        <h2 class="text-3xl font-black text-white tracking-tight">Tasks</h2>
-        <p class="text-xs text-app-glow mt-1 uppercase font-bold">Complete to Earn XP</p>
+        <h2 class="text-3xl font-black text-white tracking-tight drop-shadow-lg">Profile</h2>
       </div>
+      <div class="glass-card rounded-[2rem] p-6 text-center border-t border-t-blue-400/20">
+        <div class="w-20 h-20 mx-auto rounded-full p-[2px] bg-gradient-to-tr from-blue-600 via-crypto-glow to-indigo-500 shadow-[0_0_20px_rgba(0,240,255,0.4)] mb-4">
+          <img id="profile-photo" src="https://via.placeholder.com/150/0a0b1a/00f0ff?text=PP" alt="Profile" class="w-full h-full rounded-full object-cover border-4 border-[#050511]">
+        </div>
+        <h3 id="profile-name" class="text-xl font-black text-white tracking-wide">Name</h3>
+        <p class="text-xs text-slate-400 font-mono mt-1">ID: <span id="profile-id">00000</span></p>
 
-      <!-- AZX Crypto Sponsor Task -->
-      <div class="glass-card rounded-2xl overflow-hidden border-2 border-amber-500/30">
-        <img src="https://i.postimg.cc/rsz7NnZp/IMG-20260903-114036-951.jpg" alt="AZX Crypto" class="w-full h-32 object-cover opacity-90 pointer-events-none">
-        <div class="p-4 flex justify-between items-center bg-gradient-to-b from-transparent to-app-dark">
-          <div>
-            <h3 class="text-sm font-black text-white uppercase tracking-wider">AZX Crypto</h3>
-            <p class="text-[10px] text-amber-400 font-bold mt-0.5">Sponsor Task • Only Once</p>
+        <div class="mt-6 bg-[#050511]/50 rounded-2xl p-4 border border-slate-700/50 text-left">
+          <div class="flex justify-between items-end mb-2">
+            <div>
+              <p class="text-[10px] font-black text-blue-400 uppercase tracking-widest">Level <span id="profile-level">1</span></p>
+              <p class="text-sm font-black text-white mt-0.5"><span id="profile-current-xp">0</span> / <span id="profile-next-xp">250</span> XP</p>
+            </div>
+            <span id="profile-percent" class="text-xs font-black text-crypto-glow">0%</span>
           </div>
-          <button id="btn-azx" onclick="completeAzxTask()" class="bg-gradient-to-r from-amber-500 to-orange-500 text-white px-4 py-2 rounded-xl text-xs font-black uppercase shadow-lg active:scale-95 transition-all">+200 XP</button>
+          <div class="w-full bg-slate-800 rounded-full h-2.5 overflow-hidden shadow-inner">
+            <div id="profile-progress-bar" class="bg-gradient-to-r from-blue-500 to-crypto-glow h-full rounded-full shadow-[0_0_10px_#00f0ff]" style="width: 0%"></div>
+          </div>
+        </div>
+
+        <div class="mt-4 grid grid-cols-2 gap-3">
+          <div class="bg-[#050511]/50 border border-slate-700/50 p-3 rounded-2xl flex flex-col items-center justify-center">
+            <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider mb-1">Total Earned</p>
+            <p id="profile-total-xp" class="text-sm font-black text-white">0 XP</p>
+          </div>
+          <div class="bg-[#050511]/50 border border-slate-700/50 p-3 rounded-2xl flex flex-col items-center justify-center">
+            <p class="text-[9px] text-slate-500 uppercase font-bold tracking-wider mb-1">Boxes Opened</p>
+            <p id="profile-boxes" class="text-sm font-black text-white">0</p>
+          </div>
         </div>
       </div>
+    </div>
 
-      <!-- Standard Tasks -->
-      <div id="tasks-list" class="space-y-3">
-        <!-- Injected dynamically -->
+    <!-- TASKS PAGE -->
+    <div id="view-tasks" class="view-section hidden fade-in space-y-6 pb-4">
+      <div class="text-center pt-2">
+        <h2 class="text-3xl font-black text-white tracking-tight drop-shadow-lg">Tasks</h2>
+        <p class="text-xs text-crypto-glow mt-1 uppercase tracking-widest font-bold">Complete to Earn XP</p>
+      </div>
+      
+      <div class="glass-card rounded-3xl p-5 relative overflow-hidden border-t-2 border-t-blue-500/30">
+        <div class="absolute -right-10 -top-10 w-32 h-32 bg-blue-600/20 rounded-full blur-2xl"></div>
+        <h3 class="text-xs font-black text-white uppercase tracking-widest mb-5 flex items-center gap-2">
+          <i class="fa-solid fa-calendar-check text-blue-400 text-lg"></i> <span>7-Day Streak</span>
+        </h3>
+        <div class="relative flex justify-between items-center" id="streak-tracker-container"></div>
+      </div>
+
+      <div>
+        <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] pl-4 mb-3">Daily Missions</h3>
+        <div id="missions-container" class="space-y-3">
+          <!-- Populated by JS -->
+        </div>
+      </div>
+      
+      <!-- SPONSORED TASKS -->
+      <div class="mt-6">
+        <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] pl-4 mb-3">Sponsored Tasks</h3>
+        <div id="azx-task-container">
+          <!-- Populated by JS -->
+        </div>
       </div>
     </div>
 
-    <!-- REFERRALS VIEW -->
-    <div id="view-referrals" class="view-section hidden fade-in space-y-6">
-      <div class="text-center pt-2">
-        <h2 class="text-3xl font-black text-white tracking-tight">Referrals</h2>
-        <p class="text-xs text-blue-400 mt-1 uppercase font-bold">Earn 250 XP + $0.025</p>
+    <!-- REFERRALS PAGE -->
+    <div id="view-referrals" class="view-section hidden fade-in space-y-6 pb-4">
+      <div class="text-center pt-2 relative">
+        <h2 class="text-3xl font-black text-white tracking-tight drop-shadow-lg">Referrals</h2>
+        <p class="text-xs text-blue-400 mt-1 uppercase tracking-widest font-bold">Invite & Earn Rewards</p>
+        <button onclick="toggleRefInfo()" class="absolute top-2 right-2 w-8 h-8 rounded-full bg-blue-500/20 border border-blue-500/50 flex items-center justify-center text-blue-400 active:scale-90 transition-transform">
+          <i class="fa-solid fa-info text-sm"></i>
+        </button>
       </div>
 
       <div class="grid grid-cols-3 gap-2">
-        <div class="glass-card p-3 rounded-xl text-center border-t-2 border-t-blue-500">
-          <p class="text-[9px] text-slate-400 uppercase font-black">Total</p>
-          <p id="ui-ref-total" class="text-lg font-black text-white mt-1">0</p>
+        <div class="glass-card p-4 rounded-2xl text-center border-t-2 border-t-blue-500/30">
+          <p class="text-[9px] text-slate-400 uppercase font-black tracking-widest mb-1">Total</p>
+          <p id="ref-total" class="text-xl font-black text-white">0</p>
         </div>
-        <div class="glass-card p-3 rounded-xl text-center border-t-2 border-t-amber-500">
-          <p class="text-[9px] text-slate-400 uppercase font-black">Pending</p>
-          <p id="ui-ref-pending" class="text-lg font-black text-white mt-1">0</p>
+        <div class="glass-card p-4 rounded-2xl text-center border-t-2 border-t-amber-500/30">
+          <p class="text-[9px] text-slate-400 uppercase font-black tracking-widest mb-1">Pending</p>
+          <p id="ref-pending" class="text-xl font-black text-amber-400">0</p>
         </div>
-        <div class="glass-card p-3 rounded-xl text-center border-t-2 border-t-emerald-500">
-          <p class="text-[9px] text-slate-400 uppercase font-black">Approved</p>
-          <p id="ui-ref-approved" class="text-lg font-black text-white mt-1">0</p>
+        <div class="glass-card p-4 rounded-2xl text-center border-t-2 border-t-emerald-500/30">
+          <p class="text-[9px] text-slate-400 uppercase font-black tracking-widest mb-1">Approved</p>
+          <p id="ref-approved" class="text-xl font-black text-emerald-400">0</p>
         </div>
-      </div>
-
-      <div class="glass-card rounded-2xl p-4 border border-slate-700">
-        <div class="flex justify-between items-center mb-3">
-          <h3 class="text-xs font-black text-white uppercase">Your Invite Link</h3>
-          <button onclick="showRefInfo()" class="text-slate-400 hover:text-white"><i class="fa-solid fa-circle-info"></i></button>
-        </div>
-        <div class="flex gap-2">
-          <button onclick="copyRefLink()" class="flex-1 bg-slate-800 text-white py-2.5 rounded-xl text-xs font-black uppercase active:scale-95 transition-all"><i class="fa-regular fa-copy mr-1"></i> Copy</button>
-          <button onclick="shareRefLink()" class="flex-1 bg-blue-600 text-white py-2.5 rounded-xl text-xs font-black uppercase active:scale-95 transition-all"><i class="fa-solid fa-share-nodes mr-1"></i> Share</button>
-        </div>
-      </div>
-
-      <div>
-        <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-widest pl-2 mb-3">Your Referrals</h3>
-        <div id="referrals-list" class="space-y-2"></div>
-      </div>
-
-      <div>
-        <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-widest pl-2 mb-3">Reward History</h3>
-        <div id="referrals-history" class="space-y-2"></div>
-      </div>
-    </div>
-
-    <!-- WALLET VIEW -->
-    <div id="view-wallet" class="view-section hidden fade-in space-y-6">
-      <div class="glass-card rounded-[2rem] p-6 text-center border-t-2 border-emerald-500/40 bg-gradient-to-b from-emerald-900/30 to-app-dark">
-        <div class="w-14 h-14 mx-auto bg-emerald-500/10 rounded-full flex items-center justify-center mb-3 border border-emerald-500/30">
-          <i class="fa-solid fa-wallet text-xl text-emerald-400"></i>
-        </div>
-        <p class="text-[10px] font-black text-emerald-400 uppercase tracking-widest mb-1 opacity-80">USD Balance</p>
-        <h1 class="text-5xl font-black text-white tracking-tighter mb-2">$<span id="ui-main-usd">0.00</span></h1>
-        <p class="text-[9px] font-bold text-slate-400 uppercase bg-app-dark px-3 py-1 rounded-full border border-slate-700 inline-block">Minimum: $10.00</p>
       </div>
 
       <div class="glass-card rounded-[1.5rem] p-5 space-y-4">
         <div>
-          <label class="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 ml-1">TON Wallet Address</label>
-          <input type="text" id="input-address" placeholder="UQ..." class="w-full bg-app-dark/50 border-2 border-slate-700/50 rounded-xl py-3 px-4 text-sm font-medium text-white focus:outline-none focus:border-blue-500 transition-colors">
+          <label class="block text-[10px] font-black text-slate-400 uppercase tracking-[0.15em] mb-2 ml-1">Your Referral Link</label>
+          <div class="flex items-center gap-2">
+            <input type="text" id="ref-link-input" readonly class="flex-1 bg-[#050511]/50 border border-slate-700/50 rounded-xl py-3 px-4 text-xs font-medium text-slate-300 focus:outline-none">
+            <button onclick="copyRefLink()" class="bg-slate-800 text-white w-12 h-12 rounded-xl flex items-center justify-center active:scale-95 transition-transform border border-slate-700">
+              <i class="fa-regular fa-copy"></i>
+            </button>
+          </div>
         </div>
-        <div>
-          <label class="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2 ml-1">Amount (USD)</label>
-          <input type="number" id="input-amount" placeholder="10.00" min="10" step="0.5" class="w-full bg-app-dark/50 border-2 border-slate-700/50 rounded-xl py-3 px-4 text-sm font-bold text-emerald-400 focus:outline-none focus:border-emerald-500 transition-colors">
-        </div>
-        <button onclick="requestWithdraw()" id="btn-withdraw" class="w-full py-3.5 mt-2 bg-gradient-to-r from-emerald-600 to-teal-500 text-white font-black rounded-xl text-sm uppercase tracking-widest active:scale-95 transition-all">
-          Request Withdrawal
+        <button onclick="shareReferralTelegram()" class="w-full py-3.5 bg-gradient-to-r from-blue-600 to-cyan-500 text-white font-black rounded-xl text-sm uppercase tracking-wider flex items-center justify-center gap-2 shadow-[0_5px_15px_rgba(0,240,255,0.3)] active:scale-95 transition-transform">
+          <i class="fa-brands fa-telegram text-lg"></i> Share on Telegram
         </button>
       </div>
 
       <div>
-        <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-widest pl-2 mb-3">Withdrawal History</h3>
-        <div id="wallet-history" class="space-y-3"></div>
+        <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] pl-4 mb-3">Your Referrals</h3>
+        <div id="referral-list-container" class="space-y-3"></div>
+      </div>
+
+      <div class="mt-6">
+        <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] pl-4 mb-3 border-t border-slate-800 pt-4">Referral Reward History</h3>
+        <div id="referral-rewards-container" class="space-y-3"></div>
+      </div>
+    </div>
+
+    <!-- BOXES PAGE -->
+    <div id="view-boxes" class="view-section hidden fade-in space-y-5 pb-4">
+      <div class="text-center pt-2 mb-6">
+        <h2 class="text-3xl font-black text-white tracking-tight drop-shadow-lg">Boxes</h2>
+        <p class="text-xs text-amber-400 mt-1 uppercase tracking-widest font-bold">Try Your Luck, Win Dollars</p>
+      </div>
+      
+      <div class="box-bronze glass-card rounded-[1.5rem] p-5 relative overflow-hidden flex justify-between items-center transition-transform hover:scale-[1.02]">
+        <div class="absolute -right-4 top-1/2 -translate-y-1/2 w-32 h-32 bg-crypto-bronze/10 rounded-full blur-2xl"></div>
+        <div class="flex items-center gap-4 relative z-10">
+          <div class="w-12 h-12 rounded-xl bg-gradient-to-br from-orange-900 to-[#050511] border border-crypto-bronze flex items-center justify-center shadow-[0_0_15px_rgba(205,127,50,0.3)]">
+            <i class="fa-solid fa-box text-2xl text-crypto-bronze"></i>
+          </div>
+          <div>
+            <h3 class="text-lg font-black text-white tracking-wide">Bronze Box</h3>
+            <div class="flex flex-col mt-0.5">
+              <span class="text-[10px] text-slate-400 font-bold tracking-wider uppercase"><i class="fa-solid fa-bolt text-crypto-glow mr-1"></i> 10,000 XP</span>
+              <span class="text-[11px] text-emerald-400 font-bold mt-0.5">Maximum: $1.00</span>
+            </div>
+          </div>
+        </div>
+        <button onclick="openBox('bronze')" class="relative z-10 bg-gradient-to-b from-orange-600 to-orange-800 text-white shadow-[0_4px_15px_rgba(205,127,50,0.4)] hover:brightness-110 active:scale-95 transition-all px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wider">Open</button>
+      </div>
+
+      <div class="box-silver glass-card rounded-[1.5rem] p-5 relative overflow-hidden flex justify-between items-center transition-transform hover:scale-[1.02]">
+        <div class="absolute -right-4 top-1/2 -translate-y-1/2 w-32 h-32 bg-crypto-silver/10 rounded-full blur-2xl"></div>
+        <div class="flex items-center gap-4 relative z-10">
+          <div class="w-12 h-12 rounded-xl bg-gradient-to-br from-slate-600 to-[#050511] border border-crypto-silver flex items-center justify-center shadow-[0_0_15px_rgba(226,232,240,0.2)]">
+            <i class="fa-solid fa-box-open text-2xl text-crypto-silver"></i>
+          </div>
+          <div>
+            <h3 class="text-lg font-black text-white tracking-wide">Silver Box</h3>
+            <div class="flex flex-col mt-0.5">
+              <span class="text-[10px] text-slate-400 font-bold tracking-wider uppercase"><i class="fa-solid fa-bolt text-crypto-glow mr-1"></i> 50,000 XP</span>
+              <span class="text-[11px] text-emerald-400 font-bold mt-0.5">Maximum: $7.00</span>
+            </div>
+          </div>
+        </div>
+        <button onclick="openBox('silver')" class="relative z-10 bg-gradient-to-b from-slate-400 to-slate-600 text-crypto-dark shadow-[0_4px_15px_rgba(226,232,240,0.3)] hover:brightness-110 active:scale-95 transition-all px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wider">Open</button>
+      </div>
+
+      <div class="box-gold glass-card rounded-[1.5rem] p-5 relative overflow-hidden flex justify-between items-center border border-crypto-gold shadow-[0_0_20px_rgba(255,184,0,0.15)] transition-transform hover:scale-[1.02]">
+        <div class="absolute -right-4 top-1/2 -translate-y-1/2 w-32 h-32 bg-crypto-gold/20 rounded-full blur-xl animate-pulse"></div>
+        <div class="flex items-center gap-4 relative z-10">
+          <div class="w-12 h-12 rounded-xl bg-gradient-to-br from-amber-500 to-[#050511] border border-crypto-gold flex items-center justify-center shadow-[0_0_25px_rgba(255,184,0,0.5)]">
+            <i class="fa-solid fa-gem text-2xl text-crypto-gold drop-shadow-[0_0_10px_#ffb800]"></i>
+          </div>
+          <div>
+            <h3 class="text-lg font-black text-crypto-gold tracking-wide drop-shadow-[0_0_5px_rgba(255,184,0,0.5)]">Gold Box</h3>
+            <div class="flex flex-col mt-0.5">
+              <span class="text-[10px] text-slate-400 font-bold tracking-wider uppercase"><i class="fa-solid fa-bolt text-crypto-glow mr-1"></i> 100,000 XP</span>
+              <span class="text-[11px] text-emerald-400 font-bold mt-0.5">Maximum: $15.00</span>
+            </div>
+          </div>
+        </div>
+        <button onclick="openBox('gold')" class="relative z-10 bg-gradient-to-b from-yellow-400 to-amber-600 text-crypto-dark shadow-[0_4px_20px_rgba(255,184,0,0.6)] hover:brightness-110 active:scale-95 transition-all px-4 py-2 rounded-xl text-xs font-black uppercase tracking-wider">Open</button>
+      </div>
+    </div>
+
+    <!-- WITHDRAW PAGE -->
+    <div id="view-withdraw" class="view-section hidden fade-in space-y-6 pb-4">
+      <div class="glass-card rounded-[2rem] p-6 text-center border-t-2 border-emerald-500/40 bg-gradient-to-b from-emerald-900/30 to-[#050511]">
+        <div class="w-14 h-14 mx-auto bg-emerald-500/10 rounded-full flex items-center justify-center mb-3 border border-emerald-500/30 shadow-[0_0_20px_rgba(16,185,129,0.2)]">
+          <i class="fa-solid fa-wallet text-xl text-emerald-400"></i>
+        </div>
+        <p class="text-[10px] font-black text-emerald-400 uppercase tracking-[0.2em] mb-1 opacity-80">Withdrawal Balance</p>
+        <h1 class="text-5xl font-black text-white tracking-tighter mb-3">$<span id="withdraw-balance-display">0.00</span></h1>
+        <div class="inline-block bg-[#050511]/80 backdrop-blur-md px-3 py-1.5 rounded-full border border-slate-700/50">
+          <p class="text-[9px] font-bold text-slate-400 uppercase tracking-widest"><i class="fa-solid fa-circle-info text-blue-400 mr-1"></i> Minimum: $10</p>
+        </div>
+      </div>
+
+      <div class="glass-card rounded-[1.5rem] p-5 space-y-4 border-slate-800">
+        <div>
+          <label class="block text-[10px] font-black text-slate-400 uppercase tracking-[0.15em] mb-2 ml-1">TON Wallet Address</label>
+          <div class="relative group">
+            <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+              <img src="https://cryptologos.cc/logos/toncoin-ton-logo.png" class="w-5 h-5 opacity-70 group-focus-within:opacity-100 transition-opacity" alt="TON">
+            </div>
+            <input type="text" id="wallet-address" placeholder="UQ..." class="w-full bg-[#050511]/50 border-2 border-slate-700/50 rounded-xl py-3.5 pl-12 pr-4 text-sm font-medium text-white focus:outline-none focus:border-blue-500 transition-colors placeholder-slate-600 shadow-inner">
+          </div>
+        </div>
+        
+        <div>
+          <label class="block text-[10px] font-black text-slate-400 uppercase tracking-[0.15em] mb-2 ml-1">Amount (USD)</label>
+          <div class="relative group">
+            <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+              <i class="fa-solid fa-dollar-sign text-slate-500 group-focus-within:text-emerald-400 transition-colors text-lg"></i>
+            </div>
+            <input type="number" id="withdraw-amount" placeholder="10" min="10" step="0.5" class="w-full bg-[#050511]/50 border-2 border-slate-700/50 rounded-xl py-3.5 pl-12 pr-4 text-sm font-bold text-emerald-400 focus:outline-none focus:border-emerald-500 transition-colors placeholder-slate-600 shadow-inner">
+          </div>
+        </div>
+
+        <button onclick="requestWithdrawal()" id="withdraw-btn" class="w-full py-3.5 mt-2 bg-gradient-to-r from-emerald-600 to-teal-500 hover:brightness-110 active:scale-95 transition-all text-white font-black rounded-xl text-sm uppercase tracking-[0.15em] flex items-center justify-center gap-2 shadow-[0_10px_20px_rgba(16,185,129,0.3)]">
+          <i class="fa-solid fa-money-bill-transfer"></i> Request Withdrawal
+        </button>
+      </div>
+
+      <div>
+        <h3 class="text-[10px] font-black text-slate-500 uppercase tracking-[0.2em] pl-4 mb-3">Wallet History</h3>
+        <div id="withdraw-history-container" class="space-y-3">
+          <!-- Populated via JS -->
+        </div>
       </div>
     </div>
 
   </main>
 
-  <!-- Bottom Navigation -->
-  <nav class="fixed bottom-6 left-1/2 -translate-x-1/2 w-[calc(100%-2rem)] max-w-[400px] glass-card rounded-2xl z-50">
-    <div class="flex justify-between items-center px-4 py-3">
-      <button onclick="switchTab('home')" class="nav-btn nav-active text-slate-500 flex flex-col items-center gap-1 flex-1 transition-all" data-target="home">
-        <i class="fa-solid fa-house text-lg"></i><span class="text-[8px] font-black uppercase">Home</span>
+  <nav id="bottom-nav" class="fixed bottom-6 left-1/2 -translate-x-1/2 w-[calc(100%-1rem)] max-w-[420px] glass-card rounded-2xl pb-safe z-50 shadow-[0_20px_40px_rgba(0,0,0,0.8)] border border-slate-700/50 backdrop-blur-xl">
+    <div class="flex justify-between items-center px-2 py-2.5 relative">
+      <button onclick="switchTab('profile')" class="nav-btn text-slate-500 flex flex-col items-center gap-1 flex-1 transition-all duration-300 relative group" data-target="profile">
+        <i class="fa-solid fa-user text-lg transition-transform group-active:scale-90"></i>
+        <span class="text-[7.5px] font-black uppercase tracking-widest">Profile</span>
       </button>
-      <button onclick="switchTab('tasks')" class="nav-btn text-slate-500 flex flex-col items-center gap-1 flex-1 transition-all" data-target="tasks">
-        <i class="fa-solid fa-list-check text-lg"></i><span class="text-[8px] font-black uppercase">Tasks</span>
+      <button onclick="switchTab('home')" class="nav-btn nav-active text-slate-500 flex flex-col items-center gap-1 flex-1 transition-all duration-300 relative group" data-target="home">
+        <i class="fa-solid fa-house text-lg transition-transform group-active:scale-90"></i>
+        <span class="text-[7.5px] font-black uppercase tracking-widest">Home</span>
       </button>
-      <button onclick="switchTab('referrals')" class="nav-btn text-slate-500 flex flex-col items-center gap-1 flex-1 transition-all" data-target="referrals">
-        <i class="fa-solid fa-users text-lg"></i><span class="text-[8px] font-black uppercase">Referrals</span>
+      <button onclick="switchTab('tasks')" class="nav-btn text-slate-500 flex flex-col items-center gap-1 flex-1 transition-all duration-300 relative group" data-target="tasks">
+        <i class="fa-solid fa-list-check text-lg transition-transform group-active:scale-90"></i>
+        <span class="text-[7.5px] font-black uppercase tracking-widest">Tasks</span>
       </button>
-      <button onclick="switchTab('wallet')" class="nav-btn text-slate-500 flex flex-col items-center gap-1 flex-1 transition-all" data-target="wallet">
-        <i class="fa-solid fa-wallet text-lg"></i><span class="text-[8px] font-black uppercase">Wallet</span>
+      <button onclick="switchTab('referrals')" class="nav-btn text-slate-500 flex flex-col items-center gap-1 flex-1 transition-all duration-300 relative group" data-target="referrals">
+        <i class="fa-solid fa-users text-lg transition-transform group-active:scale-90"></i>
+        <span class="text-[7.5px] font-black uppercase tracking-widest">Referrals</span>
+      </button>
+      <button onclick="switchTab('boxes')" class="nav-btn text-slate-500 flex flex-col items-center gap-1 flex-1 transition-all duration-300 relative group" data-target="boxes">
+        <i class="fa-solid fa-box-open text-lg transition-transform group-active:scale-90"></i>
+        <span class="text-[7.5px] font-black uppercase tracking-widest">Box</span>
       </button>
     </div>
   </nav>
 
-  <!-- Modal for Referral Info -->
-  <div id="ref-modal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-[999999] flex items-center justify-center opacity-0 pointer-events-none transition-opacity">
-    <div class="glass-card w-[90%] max-w-sm rounded-2xl p-6 text-center transform scale-95 transition-transform" id="ref-modal-content">
-      <i class="fa-solid fa-users-gear text-4xl text-blue-400 mb-4"></i>
-      <h3 class="text-xl font-black text-white mb-2">Referral Rules</h3>
-      <ul class="text-sm text-slate-300 text-left space-y-2 mb-6">
-        <li><i class="fa-solid fa-check text-emerald-400 mr-2"></i> Referred user must watch <strong>25 ads</strong>.</li>
-        <li><i class="fa-solid fa-check text-emerald-400 mr-2"></i> Referred user must complete <strong>5 tasks</strong>.</li>
-        <li><i class="fa-solid fa-infinity text-blue-400 mr-2"></i> No deadline to complete conditions.</li>
-        <li><i class="fa-solid fa-gift text-purple-400 mr-2"></i> You receive <strong>250 XP + $0.025</strong> upon completion.</li>
+  <!-- Referral Information Modal -->
+  <div id="ref-info-modal" class="fixed inset-0 modal-overlay hidden flex-col items-center justify-center p-4 transition-opacity fade-in">
+    <div class="glass-card w-full max-w-sm rounded-[2rem] p-6 relative border border-blue-500/30 shadow-[0_0_40px_rgba(0,0,0,0.8)]">
+      <button onclick="toggleRefInfo()" class="absolute top-4 right-4 w-8 h-8 rounded-full bg-slate-800 text-slate-400 flex items-center justify-center hover:text-white active:scale-90 transition-transform border border-slate-700">
+        <i class="fa-solid fa-xmark"></i>
+      </button>
+      
+      <div class="w-14 h-14 mx-auto bg-blue-500/10 rounded-full flex items-center justify-center mb-4 border border-blue-500/30 text-blue-400 text-2xl shadow-[0_0_20px_rgba(59,130,246,0.2)]">
+        <i class="fa-solid fa-users"></i>
+      </div>
+      
+      <h3 class="text-xl font-black text-white text-center mb-2 tracking-wide">Referral Rules</h3>
+      <p class="text-xs text-slate-400 text-center mb-6 leading-relaxed">Invite your friends and earn rewards! A referral becomes <span class="text-emerald-400 font-bold">Approved</span> only when they complete the following requirements.</p>
+      
+      <ul class="space-y-3 mb-6">
+        <li class="flex items-start gap-3 bg-[#050511]/50 p-3 rounded-xl border border-slate-800">
+          <i class="fa-solid fa-play text-blue-400 mt-1 drop-shadow-[0_0_5px_#3b82f6]"></i>
+          <div>
+            <p class="text-sm font-black text-white">Watch 25 Ads</p>
+            <p class="text-[10px] text-slate-500 mt-0.5">The user must watch a total of 25 ads.</p>
+          </div>
+        </li>
+        <li class="flex items-start gap-3 bg-[#050511]/50 p-3 rounded-xl border border-slate-800">
+          <i class="fa-solid fa-list-check text-crypto-glow mt-1 drop-shadow-[0_0_5px_#00f0ff]"></i>
+          <div>
+            <p class="text-sm font-black text-white">Complete 5 Tasks</p>
+            <p class="text-[10px] text-slate-500 mt-0.5">The user must complete at least 5 daily missions.</p>
+          </div>
+        </li>
+        <li class="flex items-start gap-3 bg-[#050511]/50 p-3 rounded-xl border border-slate-800">
+          <i class="fa-solid fa-clock text-amber-400 mt-1 drop-shadow-[0_0_5px_#fbbf24]"></i>
+          <div>
+            <p class="text-sm font-black text-white">No Deadline</p>
+            <p class="text-[10px] text-slate-500 mt-0.5">The referral remains pending until all requirements are met.</p>
+          </div>
+        </li>
       </ul>
-      <button onclick="closeRefInfo()" class="w-full bg-slate-800 text-white font-black py-3 rounded-xl uppercase text-xs tracking-wider">Close</button>
+
+      <div class="bg-emerald-500/10 border border-emerald-500/30 p-3 rounded-xl text-center">
+        <p class="text-[10px] text-emerald-400 font-bold uppercase tracking-widest mb-1">Approval Reward</p>
+        <p class="text-lg font-black text-white">+250 XP & $0.025</p>
+      </div>
     </div>
   </div>
 
   <script>
     const tg = window.Telegram.WebApp;
-    tg.expand();
+    tg.expand(); 
     tg.ready();
     tg.setHeaderColor('#0a0b1a');
     tg.setBackgroundColor('#050511');
 
-    let currentUser = null;
-    let isFetching = false;
-    const startParam = tg.initDataUnsafe?.start_param || '';
+    // Extract TG User Data safely
+    const tgUser = tg.initDataUnsafe?.user || {
+      id: Math.floor(Math.random() * 10000000), // Fallback for local testing
+      first_name: "Demo User",
+      username: "demouser",
+      photo_url: ""
+    };
+    
+    const startParam = tg.initDataUnsafe?.start_param || null;
 
-    // --- API HELPER ---
-    async function apiCall(endpoint, payload = {}) {
+    let appState = {
+      user: {},
+      referrals: [],
+      rewards: [],
+      withdrawals: [],
+      tasks: []
+    };
+
+    // Central API Caller
+    async function apiCall(action, payload = {}) {
       try {
-        const response = await fetch(`index.php?api=${endpoint}`, {
+        const body = {
+          action: action,
+          tgId: tgUser.id,
+          firstName: tgUser.first_name,
+          username: tgUser.username,
+          photoUrl: tgUser.photo_url,
+          referrer: startParam,
+          ...payload
+        };
+
+        const res = await fetch(window.location.href, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ initData: tg.initData, start_param: startParam, ...payload })
+          body: JSON.stringify(body)
         });
-        const data = await response.json();
-        if (data.success && data.user) {
-          currentUser = data.user;
-          renderUI();
-        } else if (data.error) {
-          showToast('Error', data.error, 'error');
+        
+        const data = await res.json();
+        
+        if(data.error) {
+          showToast("Error", data.error, "error");
+          return false;
         }
-        return data.success;
+
+        // Sync local state
+        if(data.user) appState.user = data.user;
+        if(data.referrals) appState.referrals = data.referrals;
+        if(data.rewards) appState.rewards = data.rewards;
+        if(data.withdrawals) appState.withdrawals = data.withdrawals;
+        if(data.tasks) appState.tasks = data.tasks;
+
+        updateUI();
+        return data;
       } catch (err) {
-        showToast('Connection Error', 'Failed to reach server.', 'error');
+        showToast("Connection Error", "Could not reach server.", "error");
         return false;
       }
     }
 
-    // --- UI RENDERING ---
-    function renderUI() {
-      if (!currentUser) return;
-
-      // Header & Global
-      document.getElementById('ui-name').innerText = currentUser.first_name;
-      document.getElementById('ui-xp').innerHTML = `${currentUser.xp} <span class="text-[10px] text-app-glow">XP</span>`;
-      document.getElementById('ui-usd').innerText = currentUser.usd_balance.toFixed(4);
-      if (tg.initDataUnsafe?.user?.photo_url) {
-        document.getElementById('ui-avatar').src = tg.initDataUnsafe.user.photo_url;
+    function showToast(title, message, type = 'info') {
+      const toast = document.getElementById('toast-container');
+      const icon = document.getElementById('toast-icon');
+      
+      document.getElementById('toast-title').innerText = title;
+      document.getElementById('toast-message').innerText = message;
+      
+      let iconClass, iconHtml, borderStyle;
+      if (type === 'success') {
+        iconHtml = '<i class="fa-solid fa-check"></i>';
+        iconClass = 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/50 shadow-[0_0_15px_rgba(16,185,129,0.3)]';
+        borderStyle = '1px solid rgba(16, 185, 129, 0.4)';
+      } else if (type === 'error') {
+        iconHtml = '<i class="fa-solid fa-xmark"></i>';
+        iconClass = 'bg-red-500/20 text-red-400 border border-red-500/50 shadow-[0_0_15px_rgba(239,68,68,0.3)]';
+        borderStyle = '1px solid rgba(239, 68, 68, 0.4)';
+      } else if (type === 'jackpot') {
+        iconHtml = '<i class="fa-solid fa-sack-dollar animate-bounce"></i>';
+        iconClass = 'bg-amber-500/20 text-amber-400 border border-amber-500/50 shadow-[0_0_20px_rgba(251,191,36,0.6)]';
+        borderStyle = '1px solid rgba(251, 191, 36, 0.8)';
+      } else {
+        iconHtml = '<i class="fa-solid fa-bell animate-pulse"></i>';
+        iconClass = 'bg-blue-500/20 text-crypto-glow border border-crypto-glow/50 shadow-[0_0_15px_rgba(0,240,255,0.3)]';
+        borderStyle = '1px solid rgba(0, 240, 255, 0.4)';
       }
 
-      // Home
-      document.getElementById('ui-main-xp').innerText = `${currentUser.xp} XP`;
-      document.getElementById('ui-total-ads').innerText = currentUser.total_ads;
-      const dailyBtn = document.getElementById('ui-daily-btn');
-      if (currentUser.daily_login_date === new Date().toISOString().split('T')[0]) {
-        dailyBtn.innerText = 'Claimed';
-        dailyBtn.classList.replace('text-purple-400', 'text-slate-500');
-        dailyBtn.classList.add('pointer-events-none');
+      icon.innerHTML = iconHtml;
+      icon.className = `w-12 h-12 rounded-xl flex shrink-0 items-center justify-center text-xl ${iconClass}`;
+      toast.style.border = borderStyle;
+
+      toast.classList.add('toast-show');
+      
+      if (tg.HapticFeedback) {
+        if (type === 'success' || type === 'jackpot') tg.HapticFeedback.notificationOccurred('success');
+        else if (type === 'error') tg.HapticFeedback.notificationOccurred('error');
+        else tg.HapticFeedback.notificationOccurred('warning');
       }
 
-      // Wallet
-      document.getElementById('ui-main-usd').innerText = currentUser.usd_balance.toFixed(2);
-      renderWithdrawHistory();
-
-      // Referrals
-      document.getElementById('ui-ref-total').innerText = currentUser.referrals.length;
-      document.getElementById('ui-ref-pending').innerText = currentUser.pending_referrals;
-      document.getElementById('ui-ref-approved').innerText = currentUser.approved_referrals;
-      renderReferrals();
-
-      // Tasks
-      renderTasks();
+      setTimeout(() => { toast.classList.remove('toast-show'); }, type === 'jackpot' ? 5000 : 3000); 
     }
 
-    function renderTasks() {
-      const tasksConfig = [
-        { id: 'watch_5', title: 'Watch 5 Ads Today', req: 5, reward: 100, icon: 'fa-video', color: 'text-blue-400' },
-        { id: 'watch_30', title: 'Watch 30 Ads Today', req: 30, reward: 300, icon: 'fa-film', color: 'text-indigo-400' }
-      ];
-
-      const list = document.getElementById('tasks-list');
-      list.innerHTML = '';
+    function updateUI() {
+      const u = appState.user;
       
-      tasksConfig.forEach(t => {
-        const isCompleted = currentUser.task_ids.includes(t.id);
-        const progress = Math.min(currentUser.daily_ads, t.req);
-        const canClaim = !isCompleted && progress >= t.req;
+      // Header
+      document.getElementById('user-name').innerText = u.firstName;
+      document.getElementById('user-xp').innerHTML = `${u.xp.toLocaleString()} <span class="text-[10px] text-crypto-glow font-bold">XP</span>`;
+      document.getElementById('user-usd').innerText = u.usd.toFixed(4);
+      if (u.photoUrl) document.getElementById('user-photo').src = u.photoUrl;
 
-        let btn = isCompleted 
-          ? `<span class="text-[10px] font-black bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-xl border border-emerald-500/30"><i class="fa-solid fa-check"></i> Claimed</span>`
-          : (canClaim 
-              ? `<button onclick="claimTask('${t.id}')" class="text-[10px] font-black bg-app-primary text-white px-4 py-1.5 rounded-xl uppercase shadow-lg">Claim</button>`
-              : `<span class="text-[10px] font-black bg-slate-800 text-slate-300 px-3 py-1.5 rounded-xl">+${t.reward} XP</span>`);
+      // Profile Page Logic
+      const xpThresholds = [0, 250, 750, 1500, 3000, 20000];
+      let nextTarget = 20000;
+      let prevTarget = 0;
+      for (let i = 0; i < xpThresholds.length; i++) {
+          if (u.totalXp < xpThresholds[i]) {
+              nextTarget = xpThresholds[i];
+              prevTarget = xpThresholds[i-1] || 0;
+              break;
+          }
+      }
+      if (u.totalXp >= 20000) { nextTarget = 20000; prevTarget = 20000; }
+      
+      let progressPercent = 100;
+      if (nextTarget > prevTarget) {
+          progressPercent = ((u.totalXp - prevTarget) / (nextTarget - prevTarget)) * 100;
+      }
+      
+      document.getElementById('profile-name').innerText = u.firstName;
+      document.getElementById('profile-id').innerText = u.tgId;
+      document.getElementById('profile-level').innerText = u.level;
+      document.getElementById('profile-current-xp').innerText = u.totalXp.toLocaleString();
+      document.getElementById('profile-next-xp').innerText = nextTarget.toLocaleString();
+      document.getElementById('profile-percent').innerText = `${Math.min(100, Math.max(0, progressPercent)).toFixed(1)}%`;
+      document.getElementById('profile-progress-bar').style.width = `${Math.min(100, Math.max(0, progressPercent))}%`;
+      document.getElementById('profile-total-xp').innerText = `${u.totalXp.toLocaleString()} XP`;
+      document.getElementById('profile-boxes').innerText = u.boxesOpened;
+      if (u.photoUrl) document.getElementById('profile-photo').src = u.photoUrl;
 
-        list.innerHTML += `
-          <div class="glass-card rounded-2xl p-3 flex justify-between items-center">
+      // Home Page
+      document.getElementById('main-xp-display').innerText = `${u.xp.toLocaleString()} XP`;
+      document.getElementById('ads-watched').innerText = u.adsWatchedToday;
+      document.getElementById('streak-days').innerText = u.streak;
+
+      // Referrals Page
+      const pending = appState.referrals.filter(r => r.status === 'Pending').length;
+      const approved = appState.referrals.filter(r => r.status === 'Approved').length;
+      document.getElementById('ref-total').innerText = appState.referrals.length;
+      document.getElementById('ref-pending').innerText = pending;
+      document.getElementById('ref-approved').innerText = approved;
+      document.getElementById('ref-link-input').value = `https://t.me/pointplayappbot?startapp=${u.tgId}`;
+      
+      renderReferrals();
+      renderRewardHistory();
+
+      // Withdraw Page
+      document.getElementById('withdraw-balance-display').innerText = u.usd.toFixed(2);
+      renderWithdrawHistory();
+
+      // Tasks
+      renderStreakTracker();
+      renderMissions();
+    }
+
+    function renderStreakTracker() {
+      const container = document.getElementById('streak-tracker-container');
+      container.innerHTML = '';
+      const rewards = [5, 10, 15, 20, 25, 30, 50];
+      const streak = appState.user.streak || 1;
+      const claimedToday = appState.tasks.includes('streakLogin');
+      
+      for (let i = 1; i <= 7; i++) {
+        const isPast = i < streak || (i === streak && claimedToday);
+        const isToday = i === streak && !claimedToday;
+        
+        let styles = "bg-[#050511] border-slate-700 text-slate-600";
+        let icon = `<span class="text-[9px] font-black">${rewards[i-1]}</span>`;
+        let lineStyle = "bg-slate-800";
+        
+        if (isPast) {
+          styles = "bg-emerald-500/20 border-emerald-500/50 text-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.3)]";
+          icon = `<i class="fa-solid fa-check text-xs"></i>`;
+          lineStyle = "bg-emerald-500/50 shadow-[0_0_5px_#34d399]";
+        } else if (isToday) {
+          styles = "bg-blue-600/30 border-crypto-glow shadow-[0_0_20px_rgba(0,240,255,0.5)] text-white cursor-pointer";
+        }
+
+        const onClick = isToday ? `onclick="claimTask('streakLogin', ${rewards[i-1]})"` : '';
+
+        container.innerHTML += `
+          <div class="relative flex flex-col items-center gap-1.5 z-10 flex-1">
+            <div ${onClick} class="w-9 h-9 rounded-xl border-2 flex items-center justify-center transition-all duration-300 ${styles} z-10 relative bg-[#0a0b1a]">
+              ${icon}
+            </div>
+            <span class="text-[8px] font-black tracking-widest ${isToday ? 'text-crypto-glow drop-shadow-[0_0_5px_#00f0ff]' : 'text-slate-500'}">DAY ${i}</span>
+            ${i < 7 ? `<div class="absolute top-4 left-[50%] w-full h-1 -z-0 ${lineStyle} rounded-full"></div>` : ''}
+          </div>
+        `;
+      }
+    }
+
+    function renderMissions() {
+      const container = document.getElementById('missions-container');
+      container.innerHTML = '';
+      
+      const missionsList = [
+        { id: 'mission_login', label: 'Daily Login', icon: 'fa-calendar-day', color: 'text-emerald-400', bg: 'bg-emerald-500/10 border-emerald-500/20', reward: 5, target: 1, current: 1, isShare: false },
+        { id: 'mission_share', label: 'Share', icon: 'fa-share-nodes', color: 'text-pink-400', bg: 'bg-pink-500/10 border-pink-500/20', reward: 50, target: 1, current: 1, isShare: true },
+        { id: 'watch5', label: 'Watch 5 Ads', icon: 'fa-video', color: 'text-blue-400', bg: 'bg-blue-500/10 border-blue-500/20', reward: 20, target: 5, current: appState.user.adsWatchedToday, isShare: false },
+        { id: 'watch30', label: 'Watch 30 Ads', icon: 'fa-clapperboard', color: 'text-purple-400', bg: 'bg-purple-500/10 border-purple-500/20', reward: 50, target: 30, current: appState.user.adsWatchedToday, isShare: false }
+      ];
+      
+      let allCompleted = true;
+      missionsList.forEach(m => {
+          if (!appState.tasks.includes(m.id)) allCompleted = false;
+      });
+
+      missionsList.push({ id: 'mission_all', label: 'Complete All Tasks', icon: 'fa-trophy', color: 'text-amber-400', bg: 'bg-amber-500/10 border-amber-500/20', reward: 100, target: 1, current: allCompleted ? 1 : 0, isShare: false });
+
+      missionsList.forEach(m => {
+        const claimed = appState.tasks.includes(m.id);
+        const canClaim = !claimed && m.current >= m.target;
+        
+        let btnHtml = '';
+        if (claimed) {
+            btnHtml = `<span class="text-[10px] font-black bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-xl border border-emerald-500/30 flex items-center gap-1 shadow-[0_0_10px_rgba(16,185,129,0.1)inset]"><i class="fa-solid fa-check-double"></i> Claimed</span>`;
+        } else if (canClaim) {
+            const clickAction = m.isShare ? `shareAndClaim('${m.id}', ${m.reward})` : `claimTask('${m.id}', ${m.reward})`;
+            btnHtml = `<button onclick="${clickAction}" class="text-[10px] font-black bg-gradient-to-r from-blue-600 to-cyan-500 text-white px-4 py-1.5 rounded-xl shadow-[0_0_15px_rgba(0,240,255,0.4)] active:scale-95 transition-all uppercase tracking-wider">Claim</button>`;
+        } else {
+            btnHtml = `<span class="text-[10px] font-black bg-slate-800/50 text-slate-200 px-3 py-1.5 rounded-xl border border-slate-600 shadow-inner">+${m.reward} XP</span>`;
+        }
+
+        container.innerHTML += `
+          <div class="glass-card rounded-2xl p-3 flex justify-between items-center transition-transform hover:-translate-y-0.5 border border-slate-800">
             <div class="flex items-center gap-3">
-              <div class="w-10 h-10 rounded-xl bg-slate-800 flex items-center justify-center"><i class="fa-solid ${t.icon} ${t.color}"></i></div>
-              <div>
-                <p class="text-xs font-black text-white">${t.title}</p>
-                <p class="text-[10px] text-slate-400 font-bold uppercase mt-0.5">Progress: ${progress}/${t.req}</p>
+              <div class="w-10 h-10 rounded-xl border ${m.bg} flex items-center justify-center">
+                 <i class="fa-solid ${m.icon} ${m.color} text-lg"></i>
+              </div>
+              <div class="flex flex-col">
+                <span class="text-xs font-black text-white tracking-wide">${m.label}</span>
+                <span class="text-crypto-glow text-[10px] font-bold tracking-widest uppercase opacity-80 mt-0.5">(${Math.min(m.current, m.target)}/${m.target})</span>
               </div>
             </div>
-            ${btn}
+            ${btnHtml}
           </div>
         `;
       });
+      
+      // Render AZX Sponsored Task
+      const azxContainer = document.getElementById('azx-task-container');
+      if (azxContainer) {
+          const azxClaimed = appState.user.azxCryptoTaskCompleted;
+          let azxBtn = azxClaimed
+              ? `<span class="text-[10px] font-black bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-xl border border-emerald-500/30 flex items-center gap-1 shadow-[0_0_10px_rgba(16,185,129,0.1)inset]"><i class="fa-solid fa-check-double"></i> Completed</span>`
+              : `<button onclick="claimAZXTask()" class="text-[10px] font-black bg-gradient-to-r from-blue-600 to-cyan-500 text-white px-4 py-1.5 rounded-xl shadow-[0_0_15px_rgba(0,240,255,0.4)] active:scale-95 transition-all uppercase tracking-wider">Join Channel</button>`;
 
-      // Update AZX UI
-      const azxBtn = document.getElementById('btn-azx');
-      if (currentUser.azx_crypto_completed) {
-        azxBtn.innerText = 'Completed';
-        azxBtn.className = 'bg-slate-800 text-slate-500 px-4 py-2 rounded-xl text-xs font-black uppercase pointer-events-none';
+          azxContainer.innerHTML = `
+            <div class="glass-card rounded-2xl p-3 flex justify-between items-center transition-transform hover:-translate-y-0.5 border border-slate-800">
+              <div class="flex items-center gap-3">
+                <div class="w-10 h-10 rounded-xl border bg-blue-500/10 border-blue-500/20 flex items-center justify-center">
+                   <i class="fa-brands fa-telegram text-blue-400 text-lg"></i>
+                </div>
+                <div class="flex flex-col">
+                  <span class="text-xs font-black text-white tracking-wide">Join AZX Crypto</span>
+                  <span class="text-crypto-glow text-[10px] font-bold tracking-widest uppercase opacity-80 mt-0.5">+200 XP</span>
+                </div>
+              </div>
+              ${azxBtn}
+            </div>
+          `;
       }
     }
 
-    function renderReferrals() {
-      const refList = document.getElementById('referrals-list');
-      const histList = document.getElementById('referrals-history');
-      
-      refList.innerHTML = currentUser.referrals.length === 0 ? '<p class="text-xs text-slate-500 text-center py-2">No referrals yet.</p>' : '';
-      
-      currentUser.referrals.forEach(r => {
-        const isApproved = r.status === 'approved';
-        refList.innerHTML += `
-          <div class="glass-card p-3 rounded-xl flex justify-between items-center mb-2">
-            <div>
-              <p class="text-xs font-black text-white">${r.name} <span class="text-[9px] text-slate-400">${r.username ? '@'+r.username : ''}</span></p>
-              <p class="text-[9px] text-slate-400 mt-1 uppercase">Ads: <span class="${r.ad_progress>=25?'text-emerald-400':'text-blue-400'}">${r.ad_progress}/25</span> | Tasks: <span class="${r.task_progress>=5?'text-emerald-400':'text-blue-400'}">${r.task_progress}/5</span></p>
-            </div>
-            <span class="text-[9px] font-black px-2 py-1 rounded-md uppercase ${isApproved ? 'bg-emerald-500/20 text-emerald-400' : 'bg-amber-500/20 text-amber-400'}">${r.status}</span>
-          </div>`;
-      });
+    async function claimTask(taskId, reward) {
+        if(tg.HapticFeedback) tg.HapticFeedback.impactOccurred('medium');
+        const res = await apiCall('claim_task', { taskId, reward });
+        if(res && !res.error) showToast('Task Completed!', `You earned ${reward} XP!`, 'success');
+    }
 
-      histList.innerHTML = currentUser.referral_rewards.length === 0 ? '<p class="text-xs text-slate-500 text-center py-2">No rewards yet.</p>' : '';
-      currentUser.referral_rewards.forEach(h => {
-        histList.innerHTML += `
-          <div class="glass-card p-3 rounded-xl flex justify-between items-center mb-2 border border-slate-700">
-            <div>
-              <p class="text-xs font-black text-white">Referral Bonus</p>
-              <p class="text-[9px] text-slate-400 uppercase mt-0.5">User: ${h.child_name} | ${h.date}</p>
-            </div>
-            <div class="text-right">
-              <p class="text-xs font-black text-app-glow">+${h.xp} XP</p>
-              <p class="text-[10px] font-black text-emerald-400">+$${h.usd.toFixed(3)}</p>
-            </div>
-          </div>`;
-      });
+    function shareAndClaim(taskId, reward) {
+        shareReferralTelegram();
+        claimTask(taskId, reward);
+    }
+    
+    async function claimAZXTask() {
+        if(tg.HapticFeedback) tg.HapticFeedback.impactOccurred('medium');
+        tg.openTelegramLink('https://t.me/azxcrypto');
+        
+        setTimeout(async () => {
+            const res = await apiCall('claim_azx');
+            if(res && !res.error) showToast('Task Completed!', `You earned 200 XP!`, 'success');
+        }, 1500);
+    }
+
+    async function watchAd() {
+      const btn = document.getElementById('watch-ad-btn');
+      const originalHTML = btn.innerHTML;
+      btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> <span>Loading Ad...</span>`;
+      btn.classList.add('opacity-80', 'pointer-events-none');
+
+      if (window.Adsgram) {
+        const AdController = window.Adsgram.init({ blockId: "int-35545" });
+        AdController.show().then(async () => {
+          const res = await apiCall('watch_ad');
+          if(res && !res.error) showToast('Reward Granted!', 'You earned +20 XP.', 'success');
+          
+          btn.innerHTML = originalHTML;
+          btn.classList.remove('opacity-80', 'pointer-events-none');
+        }).catch((e) => {
+          btn.innerHTML = originalHTML;
+          btn.classList.remove('opacity-80', 'pointer-events-none');
+        });
+      } else {
+        showToast('Error', 'Ad system is currently unavailable.', 'error');
+        btn.innerHTML = originalHTML;
+        btn.classList.remove('opacity-80', 'pointer-events-none');
+      }
+    }
+
+    async function openBox(type) {
+      if(tg.HapticFeedback) tg.HapticFeedback.impactOccurred('heavy');
+      const res = await apiCall('open_box', { boxType: type });
+      
+      if(res && !res.error) {
+        if(res.jackpot) {
+            showToast('HUGE JACKPOT! 💸', `Incredible! You won $${res.reward.toFixed(2)}!`, 'jackpot');
+        } else {
+            showToast('Box Opened!', `Congratulations! You won $${res.reward.toFixed(2)}!`, 'success');
+        }
+      }
+    }
+
+    async function requestWithdrawal() {
+      const address = document.getElementById('wallet-address').value;
+      const amount = parseFloat(document.getElementById('withdraw-amount').value);
+
+      if (!address || address.length < 10) {
+        showToast('Invalid Address', 'Please enter a valid TON wallet address.', 'error');
+        return;
+      }
+      if (isNaN(amount) || amount < 10) {
+        showToast('Invalid Amount', 'The minimum withdrawal amount is $10.', 'error');
+        return;
+      }
+      if (amount > appState.user.usd) {
+        showToast('Insufficient Balance', 'You do not have enough funds.', 'error');
+        return;
+      }
+
+      const res = await apiCall('withdraw', { amount, address });
+      if(res && !res.error) {
+          showToast('Withdrawal Requested', `Your request for $${amount.toFixed(2)} has been submitted.`, 'success');
+          document.getElementById('wallet-address').value = '';
+          document.getElementById('withdraw-amount').value = '';
+      }
     }
 
     function renderWithdrawHistory() {
-      const container = document.getElementById('wallet-history');
-      container.innerHTML = currentUser.withdrawals.length === 0 ? '<p class="text-xs text-slate-500 text-center py-2">No history.</p>' : '';
+      const container = document.getElementById('withdraw-history-container');
+      const history = appState.withdrawals;
       
-      currentUser.withdrawals.forEach(w => {
-        container.innerHTML += `
-          <div class="glass-card p-3 rounded-xl flex justify-between items-center">
-            <div>
-              <p class="text-xs font-black text-white">${w.id}</p>
-              <p class="text-[9px] text-slate-400 mt-0.5 font-mono">${w.address.substring(0,6)}...${w.address.substring(w.address.length-4)}</p>
+      if (history.length === 0) {
+        container.innerHTML = `
+          <div class="glass-card rounded-2xl p-6 text-center border-dashed border-2 border-slate-700">
+            <i class="fa-solid fa-clock-rotate-left text-3xl text-slate-600 mb-2"></i>
+            <p class="text-xs font-bold text-slate-500 uppercase tracking-widest">History is Empty</p>
+          </div>`;
+        return;
+      }
+
+      container.innerHTML = history.map(r => `
+          <div class="glass-card rounded-2xl p-4 flex justify-between items-center">
+            <div class="flex items-center gap-3">
+              <div class="w-10 h-10 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center">
+                 <i class="fa-solid fa-arrow-right-arrow-left text-slate-400"></i>
+              </div>
+              <div>
+                <p class="text-xs font-black text-white">${r.id} <span class="text-[9px] text-slate-400 ml-1 font-bold">${r.date}</span></p>
+                <p class="text-[10px] text-blue-400 mt-0.5 font-mono bg-blue-500/10 inline-block px-1.5 py-0.5 rounded">${r.address}</p>
+              </div>
             </div>
             <div class="text-right">
-              <p class="text-sm font-black text-emerald-400">-$${w.amount.toFixed(2)}</p>
-              <p class="text-[9px] font-black text-amber-400 uppercase mt-0.5">${w.status}</p>
+              <p class="text-sm font-black text-emerald-400">-$${r.amount.toFixed(2)}</p>
+              <p class="text-[9px] font-black text-amber-400 uppercase tracking-widest mt-0.5 bg-amber-500/10 inline-block px-2 py-0.5 rounded-full border border-amber-500/20">${r.status}</p>
             </div>
-          </div>`;
+          </div>
+      `).join('');
+    }
+
+    function copyRefLink() {
+      const link = document.getElementById('ref-link-input').value;
+      navigator.clipboard.writeText(link).then(() => {
+        showToast("Success", "Referral link copied!", "success");
       });
     }
 
-    // --- ACTIONS ---
-    async function watchAd() {
-      if (isFetching) return;
-      const btn = document.getElementById('btn-watch-ad');
-      btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> <span>Loading Ad...</span>`;
+    function shareReferralTelegram() {
+      const link = `https://t.me/pointplayappbot?startapp=${appState.user.tgId}`;
+      const text = `🎯 Play games, complete tasks, earn XP, and collect exciting rewards 🚀 I’m already playing on Point Play now it’s your turn to join the adventure👇`;
+      const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(text)}`;
+      tg.openTelegramLink(shareUrl);
+    }
+
+    function toggleRefInfo() {
+      document.getElementById('ref-info-modal').classList.toggle('hidden');
+      document.getElementById('ref-info-modal').classList.toggle('flex');
+    }
+
+    function renderReferrals() {
+      const container = document.getElementById('referral-list-container');
+      const list = appState.referrals;
       
-      if (window.Adsgram) {
-        try {
-          const adController = window.Adsgram.init({ blockId: "int-35545" });
-          await adController.show();
-          isFetching = true;
-          await apiCall('watch_ad');
-          isFetching = false;
-          showToast('Reward Granted!', '+20 XP earned.', 'success');
-        } catch (e) {
-          showToast('Notice', 'Ad skipped or unavailable.', 'error');
-        }
-      } else {
-        showToast('Error', 'Ad system offline.', 'error');
+      if (list.length === 0) {
+        container.innerHTML = `
+          <div class="glass-card rounded-2xl p-6 text-center border-dashed border-2 border-slate-700">
+            <i class="fa-solid fa-user-plus text-3xl text-slate-600 mb-2"></i>
+            <p class="text-xs font-bold text-slate-500 uppercase tracking-widest">No referrals yet</p>
+          </div>`;
+        return;
       }
-      btn.innerHTML = `<i class="fa-solid fa-play bg-white/20 p-2 rounded-full text-xs"></i> <span>Watch Ad <span class="text-cyan-200">+20 XP</span></span>`;
+
+      container.innerHTML = list.map(r => {
+        const isAppr = r.status === 'Approved';
+        const statusClass = isAppr ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' : 'bg-amber-500/10 text-amber-400 border-amber-500/30';
+        const displayUsername = r.username ? `@${r.username}` : '';
+        const initial = r.name ? r.name.charAt(0).toUpperCase() : 'U';
+
+        return `
+          <div class="glass-card rounded-2xl p-4 flex flex-col gap-3">
+            <div class="flex justify-between items-center">
+              <div class="flex items-center gap-3">
+                <div class="w-10 h-10 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center font-black text-white shadow-inner">${initial}</div>
+                <div class="flex flex-col">
+                  <span class="text-sm font-black text-white tracking-wide">${r.name}</span>
+                  ${displayUsername ? `<span class="text-[10px] text-slate-400 font-mono">${displayUsername}</span>` : ''}
+                </div>
+              </div>
+              <span class="text-[9px] font-black uppercase tracking-widest px-2 py-1 rounded border ${statusClass}">${r.status}</span>
+            </div>
+            
+            ${!isAppr ? `
+            <div class="bg-[#050511]/50 rounded-xl p-3 border border-slate-800 grid grid-cols-2 gap-2">
+              <div class="text-center">
+                <p class="text-[9px] font-bold text-slate-500 uppercase tracking-widest mb-1">Ads Watched</p>
+                <div class="w-full bg-slate-800 rounded-full h-1.5 mb-1 overflow-hidden">
+                  <div class="bg-blue-500 h-full rounded-full" style="width: ${Math.min((r.ads/25)*100, 100)}%"></div>
+                </div>
+                <p class="text-[10px] font-black text-white">${r.ads} <span class="text-slate-500">/ 25</span></p>
+              </div>
+              <div class="text-center">
+                <p class="text-[9px] font-bold text-slate-500 uppercase tracking-widest mb-1">Tasks Done</p>
+                <div class="w-full bg-slate-800 rounded-full h-1.5 mb-1 overflow-hidden">
+                  <div class="bg-crypto-glow h-full rounded-full" style="width: ${Math.min((r.tasks/5)*100, 100)}%"></div>
+                </div>
+                <p class="text-[10px] font-black text-white">${r.tasks} <span class="text-slate-500">/ 5</span></p>
+              </div>
+            </div>` : ''}
+          </div>
+        `;
+      }).join('');
     }
 
-    async function claimDaily() {
-      if(isFetching) return;
-      isFetching = true;
-      const success = await apiCall('claim_daily');
-      isFetching = false;
-      if(success) showToast('Daily Login', 'Claimed +50 XP successfully!', 'success');
-    }
-
-    async function claimTask(taskId) {
-      if(isFetching) return;
-      isFetching = true;
-      const success = await apiCall('complete_task', { task_id: taskId });
-      isFetching = false;
-      if(success) showToast('Task Complete', 'XP Rewarded!', 'success');
-    }
-
-    async function completeAzxTask() {
-      if(isFetching) return;
-      tg.openTelegramLink('https://t.me/azxcrypto');
-      isFetching = true;
-      setTimeout(async () => {
-        const success = await apiCall('azx_crypto');
-        isFetching = false;
-        if(success) showToast('Task Complete', '+200 XP from AZX Crypto!', 'success');
-      }, 2000);
-    }
-
-    async function requestWithdraw() {
-      if(isFetching) return;
-      const address = document.getElementById('input-address').value;
-      const amount = parseFloat(document.getElementById('input-amount').value);
+    function renderRewardHistory() {
+      const container = document.getElementById('referral-rewards-container');
+      const rewards = appState.rewards;
       
-      if (!address || address.length < 10) return showToast('Error', 'Invalid TON Address', 'error');
-      if (isNaN(amount) || amount < 10) return showToast('Error', 'Minimum withdrawal is $10.00', 'error');
-      if (amount > currentUser.usd_balance) return showToast('Error', 'Insufficient balance', 'error');
-
-      isFetching = true;
-      const success = await apiCall('withdraw', { amount: amount, address: address });
-      isFetching = false;
-      
-      if(success) {
-        showToast('Success', 'Withdrawal requested successfully.', 'success');
-        document.getElementById('input-address').value = '';
-        document.getElementById('input-amount').value = '';
+      if (rewards.length === 0) {
+        container.innerHTML = `
+          <div class="glass-card rounded-2xl p-4 text-center border-dashed border border-slate-700">
+            <p class="text-[10px] font-bold text-slate-500 uppercase tracking-widest">No rewards yet</p>
+          </div>`;
+        return;
       }
+
+      container.innerHTML = rewards.map(r => `
+        <div class="glass-card rounded-xl p-3 flex justify-between items-center border border-slate-800">
+          <div class="flex items-center gap-3">
+            <div class="w-8 h-8 rounded-full bg-emerald-500/20 border border-emerald-500/50 flex items-center justify-center text-emerald-400">
+               <i class="fa-solid fa-gift text-sm"></i>
+            </div>
+            <div>
+              <p class="text-xs font-black text-white">${r.title}</p>
+              <p class="text-[9px] text-slate-400">${r.desc} • ${r.date}</p>
+            </div>
+          </div>
+          <div class="text-right flex flex-col items-end">
+            <span class="text-[10px] font-black text-crypto-glow">+${r.xp} XP</span>
+            <span class="text-[10px] font-black text-emerald-400">+$${r.usd.toFixed(3)}</span>
+          </div>
+        </div>
+      `).join('');
     }
 
-    // --- REFERRAL HELPERS ---
-    function getRefLink() {
-      return `https://t.me/pointplayappbot?startapp=${currentUser.telegram_id}`;
-    }
-    function copyRefLink() {
-      navigator.clipboard.writeText(getRefLink());
-      showToast('Copied', 'Referral link copied!', 'success');
-    }
-    function shareRefLink() {
-      const text = encodeURIComponent("🎯 Play games, complete tasks, earn XP, and collect exciting rewards 🚀 I’m already playing on Point Play now it’s your turn to join the adventure👇\n\n");
-      tg.openTelegramLink(`https://t.me/share/url?url=${encodeURIComponent(getRefLink())}&text=${text}`);
-    }
-    function showRefInfo() {
-      document.getElementById('ref-modal').classList.remove('opacity-0', 'pointer-events-none');
-      document.getElementById('ref-modal-content').classList.remove('scale-95');
-    }
-    function closeRefInfo() {
-      document.getElementById('ref-modal').classList.add('opacity-0', 'pointer-events-none');
-      document.getElementById('ref-modal-content').classList.add('scale-95');
-    }
-
-    // --- NAVIGATION ---
+    let headerTimeout;
     function switchTab(tabId) {
       document.querySelectorAll('.view-section').forEach(el => el.classList.add('hidden'));
       document.querySelectorAll('.nav-btn').forEach(btn => btn.classList.remove('nav-active'));
+
       document.getElementById(`view-${tabId}`).classList.remove('hidden');
       document.querySelector(`[data-target="${tabId}"]`).classList.add('nav-active');
+      
+      const header = document.getElementById('main-header');
+      const mainContent = document.getElementById('app-content');
+
+      clearTimeout(headerTimeout);
+
+      if (tabId === 'withdraw') {
+        header.style.transform = 'translateY(-100%)';
+        headerTimeout = setTimeout(() => header.style.display = 'none', 300);
+        mainContent.classList.remove('pt-[120px]');
+        mainContent.classList.add('pt-4');
+      } else {
+        header.style.display = 'block'; 
+        setTimeout(() => header.style.transform = 'translateY(0)', 10);
+        mainContent.classList.remove('pt-4');
+        mainContent.classList.add('pt-[120px]');
+      }
+      
       if (tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
 
-    function showToast(title, message, type) {
-      const toast = document.getElementById('toast-container');
-      const icon = document.getElementById('toast-icon');
-      document.getElementById('toast-title').innerText = title;
-      document.getElementById('toast-message').innerText = message;
+    function updateTimer() {
+        const now = new Date();
+        const tomorrow = new Date(now);
+        tomorrow.setUTCHours(24, 0, 0, 0); 
+        
+        const diff = tomorrow.getTime() - now.getTime();
+        const h = Math.floor(diff / 1000 / 60 / 60);
+        const m = Math.floor((diff / 1000 / 60) % 60);
+        const s = Math.floor((diff / 1000) % 60);
+        
+        document.getElementById('reset-timer').innerText = 
+          `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    }
+    
+    async function initApp() {
+      const res = await apiCall('init');
       
-      if (type === 'success') {
-        icon.innerHTML = '<i class="fa-solid fa-check"></i>';
-        icon.className = 'w-12 h-12 rounded-xl flex shrink-0 items-center justify-center text-xl bg-emerald-500/20 text-emerald-400';
-      } else {
-        icon.innerHTML = '<i class="fa-solid fa-xmark"></i>';
-        icon.className = 'w-12 h-12 rounded-xl flex shrink-0 items-center justify-center text-xl bg-red-500/20 text-red-400';
-      }
+      setTimeout(() => {
+        document.getElementById('loading-overlay').style.opacity = '0';
+        setTimeout(() => { document.getElementById('loading-overlay').style.display = 'none'; }, 500); 
+      }, 500);
       
-      toast.classList.add('toast-show');
-      if (tg.HapticFeedback) tg.HapticFeedback.notificationOccurred(type);
-      setTimeout(() => toast.classList.remove('toast-show'), 3000);
+      setInterval(updateTimer, 1000);
+      updateTimer();
     }
 
-    // Initialize App
-    apiCall('init');
+    window.addEventListener('load', initApp);
   </script>
 </body>
 </html>

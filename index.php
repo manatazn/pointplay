@@ -3,7 +3,7 @@
 // All server-side logic and persistence is handled here.
 
 error_reporting(0); // Suppress errors for clean JSON API responses in production
-date_default_timezone_set('UTC'); // Server time consistency
+date_default_timezone_set('Europe/Moscow'); // Server time consistency in MSK (Russia)
 $dataDir = __DIR__ . '/data';
 
 // Create data directory if it doesn't exist
@@ -42,12 +42,27 @@ function writeDB($filename, $data) {
     return true;
 }
 
-// Ensure settings exist
+// Ensure settings exist (Multiple APIs Supported)
 $settings = readDB('settings.json');
-if (empty($settings)) {
-    $settings = ['adBlockId' => 'int-35545'];
+if (empty($settings) || !isset($settings['adBlockIds'])) {
+    $settings = [
+        'adBlockIds' => [
+            'int-35545', 'int-35546', 'int-35547', 'int-35548', 'int-35549', 
+            'int-35550', 'int-35551', 'int-35552', 'int-35553', 'int-35554',
+            'int-35555', 'int-35556', 'int-35557', 'int-35558', 'int-35559'
+        ]
+    ];
     writeDB('settings.json', $settings);
 }
+
+// Logical Date Calculation: New day starts at 03:00 MSK
+$now = new DateTime('now');
+$hour = (int)$now->format('H');
+$logicalDate = clone $now;
+if ($hour < 3) {
+    $logicalDate->modify('-1 day');
+}
+$today = $logicalDate->format('Y-m-d'); // This is the logic "day" for reset tracking
 
 // Handle API requests
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -61,7 +76,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     $action = $input['action'];
     $uid = (string)$input['tgId'];
-    $today = date('Y-m-d');
     
     $users = readDB('users.json');
     $referrals = readDB('referrals.json');
@@ -92,10 +106,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'tasksCompleted' => 0,
             'boxesOpened' => 0,
             'streak' => 1,
-            'lastResetDay' => $today,
+            'lastResetDay' => $today, // Uses logic day
             'referrer' => null,
             'sponsorAzx' => false,
-            'lastActive' => date('Y-m-d H:i:s'),
+            'lastActive' => $now->format('Y-m-d H:i:s'),
             'banned' => false
         ];
 
@@ -111,7 +125,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'status' => 'Pending',
                     'ads' => 0,
                     'tasks' => 0,
-                    'joinDate' => date('M j, Y')
+                    'joinDate' => $now->format('M j, Y')
                 ];
                 writeDB('referrals.json', $referrals);
             }
@@ -121,10 +135,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (isset($input['lastName'])) $users[$uid]['lastName'] = $input['lastName'];
         if (isset($input['username'])) $users[$uid]['username'] = $input['username'];
         if (isset($input['photoUrl']) && !empty($input['photoUrl'])) $users[$uid]['photoUrl'] = $input['photoUrl'];
-        $users[$uid]['lastActive'] = date('Y-m-d H:i:s');
+        $users[$uid]['lastActive'] = $now->format('Y-m-d H:i:s');
     }
 
-    // Daily Reset Logic
+    // Daily Reset Logic based on Logical Date (03:00 MSK)
     if ($users[$uid]['lastResetDay'] !== $today) {
         $lastDay = strtotime($users[$uid]['lastResetDay']);
         $currDay = strtotime($today);
@@ -153,6 +167,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     // Helper: Evaluate Referral Approval
     function evaluateReferralProgress($refUid, &$users, &$referrals, &$rewards) {
+        global $now;
         $refUser = $users[$refUid];
         if (empty($refUser['referrer'])) return;
         
@@ -171,7 +186,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 if ($r['ads'] >= 25 && $r['tasks'] >= 5) {
                     $r['status'] = 'Approved';
-                    $r['approvedAt'] = date('M j, Y');
+                    $r['approvedAt'] = $now->format('M j, Y');
                     $referralChanged = true;
                     $rewardAdded = true;
                     
@@ -187,7 +202,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'desc' => "Referral: " . $refName,
                         'xp' => 250,
                         'usd' => 0.025,
-                        'date' => date('M j, Y')
+                        'date' => $now->format('M j, Y')
                     ]);
                 }
                 break;
@@ -199,9 +214,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     $response = ['success' => true];
     
-    // Server time for accurate frontend countdown
-    $response['serverTime'] = time();
-    $response['serverResetTime'] = strtotime('tomorrow 00:00:00'); 
+    // Server time for accurate frontend countdown (Bypasses phone time)
+    $resetTarget = clone $now;
+    $resetTarget->setTime(3, 0, 0); // Target 03:00 MSK
+    if ($hour >= 3) {
+        $resetTarget->modify('+1 day');
+    }
+    $response['serverTime'] = $now->getTimestamp();
+    $response['serverResetTime'] = $resetTarget->getTimestamp(); 
     $response['settings'] = $settings;
 
     // --- ADMIN PANEL SECURE ROUTES ---
@@ -224,7 +244,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             foreach($withdrawals as $wList) {
                 foreach($wList as $w) {
-                    if ($w['status'] === 'Approved') $totalUsd += $w['amount']; // Include withdrawn money in total generated
+                    if ($w['status'] === 'Approved') $totalUsd += $w['amount'];
                 }
             }
             foreach($referrals as $rList) { $totalRefs += count($rList); }
@@ -248,9 +268,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         if ($action === 'admin_update_settings') {
-            $settings['adBlockId'] = $input['blockId'];
+            $settings['adBlockIds'] = $input['blockIds'];
             writeDB('settings.json', $settings);
-            $response['message'] = 'Settings updated successfully.';
+            $response['message'] = 'Settings (APIs) updated successfully.';
             echo json_encode($response); exit;
         }
 
@@ -281,7 +301,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($action === 'admin_action_withdraw') {
             $targetUid = $input['targetUid'];
             $idx = $input['idx'];
-            $wAct = $input['withdrawAction']; // 'approve' or 'reject'
+            $wAct = $input['withdrawAction'];
 
             if (isset($withdrawals[$targetUid][$idx])) {
                 if ($withdrawals[$targetUid][$idx]['status'] === 'Pending') {
@@ -289,7 +309,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $withdrawals[$targetUid][$idx]['status'] = 'Approved';
                     } else if ($wAct === 'reject') {
                         $withdrawals[$targetUid][$idx]['status'] = 'Rejected';
-                        // Refund
                         $users[$targetUid]['usd'] += $withdrawals[$targetUid][$idx]['amount'];
                         writeDB('users.json', $users);
                     }
@@ -388,7 +407,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'id' => '#' . strtoupper(substr(md5(uniqid()), 0, 6)),
                     'amount' => $amount,
                     'address' => substr($address, 0, 6) . '...' . substr($address, -4),
-                    'date' => date('M j, Y H:i:s'),
+                    'date' => $now->format('M j, Y H:i:s'),
                     'status' => 'Pending'
                 ]);
                 writeDB('withdrawals.json', $withdrawals);
@@ -471,7 +490,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     body { background-color: #050511; color: #f8fafc; overflow-x: hidden; user-select: none; -webkit-user-select: none; }
     .bg-orb-1 { position: fixed; top: -10%; left: -10%; width: 50vw; height: 50vw; background: radial-gradient(circle, rgba(59, 130, 246, 0.15) 0%, rgba(0, 0, 0, 0) 70%); z-index: -1; filter: blur(40px); }
     .bg-orb-2 { position: fixed; bottom: -10%; right: -10%; width: 60vw; height: 60vw; background: radial-gradient(circle, rgba(0, 240, 255, 0.1) 0%, rgba(0, 0, 0, 0) 70%); z-index: -1; filter: blur(50px); }
-    input { user-select: auto !important; }
+    input, textarea { user-select: auto !important; }
     ::-webkit-scrollbar { width: 0px; background: transparent; }
     .glass-card { background: linear-gradient(145deg, rgba(20, 22, 45, 0.7) 0%, rgba(10, 11, 26, 0.85) 100%); backdrop-filter: blur(20px); border: 1px solid rgba(255, 255, 255, 0.05); box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3); }
     .fade-in { animation: fadeIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
@@ -935,8 +954,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       <!-- Settings -->
       <div id="admin-sec-settings" class="admin-section hidden space-y-3">
           <div class="glass-card rounded-xl p-4 border border-slate-700">
-              <label class="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5">Adsgram Block ID</label>
-              <input type="text" id="admin-ad-sdk" class="w-full bg-[#050511] border border-slate-700 rounded-lg py-2.5 px-3 text-xs text-white focus:border-blue-500 outline-none mb-3">
+              <label class="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5">Adsgram Block IDs (Comma separated)</label>
+              <textarea id="admin-ad-sdk" rows="4" class="w-full bg-[#050511] border border-slate-700 rounded-lg py-2.5 px-3 text-xs text-white focus:border-blue-500 outline-none mb-3" placeholder="int-35545, int-35546, ..."></textarea>
               <button onclick="saveAdminSettings()" class="w-full py-2 bg-blue-600 text-white rounded text-xs font-black uppercase tracking-wider">Save Settings</button>
           </div>
       </div>
@@ -1020,7 +1039,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     const startParam = tg.initDataUnsafe?.start_param || null;
 
     let appState = {
-      user: {}, referrals: [], rewards: [], withdrawals: [], tasks: [], settings: { adBlockId: 'int-35545' }
+      user: {}, referrals: [], rewards: [], withdrawals: [], tasks: [], settings: { adBlockIds: ['int-35545'] }
     };
     
     // Admin globals
@@ -1185,25 +1204,49 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if(res && !res.error) showToast('Task Completed!', `You earned +${reward} XP!`, 'success');
     }
 
+    // UPDATED: MULTI-API FALLBACK SYSTEM
     async function watchAd() {
-      const btn = document.getElementById('watch-ad-btn'); const originalHTML = btn.innerHTML;
+      const btn = document.getElementById('watch-ad-btn'); 
+      const originalHTML = btn.innerHTML;
       btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin text-base"></i> <span>Loading...</span>`;
       btn.classList.add('opacity-80', 'pointer-events-none');
-      if (window.Adsgram) {
-        const AdController = window.Adsgram.init({ blockId: appState.settings.adBlockId || "int-35545" });
-        AdController.show().then(async () => {
-          const res = await apiCall('watch_ad');
-          if(res && !res.error) showToast('Reward Granted!', 'You earned +20 XP.', 'success');
-          btn.innerHTML = originalHTML; btn.classList.remove('opacity-80', 'pointer-events-none');
-        }).catch(() => { btn.innerHTML = originalHTML; btn.classList.remove('opacity-80', 'pointer-events-none'); });
-      } else { showToast('Error', 'Ad system is currently unavailable.', 'error'); btn.innerHTML = originalHTML; btn.classList.remove('opacity-80', 'pointer-events-none'); }
+      
+      const blockIds = appState.settings.adBlockIds || ["int-35545"];
+      let adShown = false;
+      
+      // Rotate through APIs if one fails or hits a limit
+      for(let i = 0; i < blockIds.length; i++) {
+        let currentId = blockIds[i].trim();
+        if(!currentId) continue;
+        
+        try {
+          if (window.Adsgram) {
+            const AdController = window.Adsgram.init({ blockId: currentId });
+            await AdController.show(); // This returns a promise
+            adShown = true;
+            break; // Ad loaded successfully, exit the loop
+          }
+        } catch (e) {
+          console.warn(`Adsgram API (${currentId}) failed or limited. Trying next API...`);
+        }
+      }
+      
+      if(adShown) {
+         const res = await apiCall('watch_ad');
+         if(res && !res.error) showToast('Reward Granted!', 'You earned +20 XP.', 'success');
+      } else {
+         showToast('Error', 'No ads available right now across all networks. Please try again later.', 'error');
+      }
+      
+      btn.innerHTML = originalHTML; 
+      btn.classList.remove('opacity-80', 'pointer-events-none');
     }
 
     async function openBox(type) {
       if(tg.HapticFeedback) tg.HapticFeedback.impactOccurred('heavy');
       const res = await apiCall('open_box', { boxType: type });
       if(res && !res.error) {
-        if(res.jackpot) showToast('HUGE JACKPOT! 💸', `Incredible! You won $${res.reward.toFixed(2)} USDT!`, 'jackpot');
+        if(res.jackpot) showToast('HUGE JACKPOT! 🤑', `Incredible! You won $${res.reward.toFixed(2)} USDT!`, 'jackpot');
         else showToast('Box Opened!', `Congratulations! You won $${res.reward.toFixed(2)} USDT!`, 'success');
       }
     }
@@ -1225,7 +1268,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     function copyRefLink() { navigator.clipboard.writeText(document.getElementById('ref-link-input').value).then(() => showToast("Success", "Referral link copied!", "success")); }
-    function shareReferralTelegram() { tg.openTelegramLink(`https://t.me/share/url?url=${encodeURIComponent(`https://t.me/pointplayappbot?startapp=${appState.user.tgId}`)}&text=${encodeURIComponent(`🚀 Complete premium tasks, open boxes, and earn USDT straight to your TON Wallet! 🤑 I'm already playing Point Play, join me now 🔥`)}`); }
+    function shareReferralTelegram() { tg.openTelegramLink(`https://t.me/share/url?url=${encodeURIComponent(`https://t.me/pointplayappbot?startapp=${appState.user.tgId}`)}&text=${encodeURIComponent(`🔥 Complete premium tasks, open boxes, and earn USDT straight to your TON Wallet! 💸 I'm already playing Point Play, join me now 🚀`)}`); }
     function toggleRefInfo() { document.getElementById('ref-info-modal').classList.toggle('hidden'); document.getElementById('ref-info-modal').classList.toggle('flex'); }
 
     function renderReferrals() {
@@ -1255,16 +1298,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
 
-    // SERVER-SYNCED TIMER
-    let serverTimeSec = 0;
-    let nextResetSec = 0;
+    // SERVER-SYNCED TIMER (Independent of Device Time)
     let timeRemaining = 0;
+    let timerInterval = null;
     
     function startServerTimer(currentServer, resetServer) {
+        if(timerInterval) clearInterval(timerInterval);
         timeRemaining = resetServer - currentServer;
-        setInterval(() => {
+        
+        timerInterval = setInterval(() => {
             if (timeRemaining > 0) timeRemaining--;
-            if (timeRemaining <= 0) { document.getElementById('reset-timer').innerText = "00:00:00"; return; }
+            if (timeRemaining <= 0) { 
+                document.getElementById('reset-timer').innerText = "00:00:00"; 
+                // Auto reload to fetch new day data once hit zero
+                setTimeout(() => { window.location.reload(); }, 2000);
+                return; 
+            }
             
             const h = Math.floor(timeRemaining / 3600);
             const m = Math.floor((timeRemaining % 3600) / 60);
@@ -1303,7 +1352,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             document.getElementById('adm-stat-xp').innerText = res.stats.xp;
             document.getElementById('adm-stat-refs').innerText = res.stats.refs;
             
-            document.getElementById('admin-ad-sdk').value = appState.settings.adBlockId;
+            document.getElementById('admin-ad-sdk').value = (appState.settings.adBlockIds || []).join(', ');
             adminUsers = res.all_users;
             adminWithdrawals = res.all_withdrawals;
             renderAdminUsers();
@@ -1398,11 +1447,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     async function saveAdminSettings() {
-        const blockId = document.getElementById('admin-ad-sdk').value;
-        const res = await apiCall('admin_update_settings', { adminCode: adminToken, blockId });
+        const blockIdsStr = document.getElementById('admin-ad-sdk').value;
+        const blockIds = blockIdsStr.split(',').map(id => id.trim()).filter(id => id.length > 0);
+        
+        const res = await apiCall('admin_update_settings', { adminCode: adminToken, blockIds });
         if(res && !res.error) {
             showToast('Success', res.message, 'success');
-            appState.settings.adBlockId = blockId;
+            appState.settings.adBlockIds = blockIds;
         }
     }
 
